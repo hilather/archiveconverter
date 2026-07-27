@@ -106,3 +106,48 @@ fn rename_collision_fails_plan() {
         "{msg}"
     );
 }
+
+/// Corrupt nested .7z is skipped; good members still appear in the output.
+#[test]
+fn corrupt_nested_is_skipped_others_succeed() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let stage = root.path().join("stage");
+    fs::create_dir_all(&stage).unwrap();
+
+    // Valid nested
+    let good = make_inner_solid(root.path(), "good.7z");
+    fs::copy(&good, stage.join("good.7z")).unwrap();
+    // Corrupt nested (not a real 7z)
+    fs::write(stage.join("corrupt.7z"), b"this is not a valid 7z archive!!!!").unwrap();
+    // Passthrough text
+    write_file(&stage, "readme.txt", "hello\n");
+
+    let outer = root.path().join("outer.7z");
+    pack_solid(&stage, &outer);
+
+    let out = root.path().join("converted.7z");
+    let mut opts = PipelineOptions::new(outer, out.clone());
+    opts.pack = default_pack();
+    opts.verify = true;
+    opts.nested_concurrency = 1; // serial path
+    opts.temp_dir = Some(root.path().join("tmp"));
+
+    // Must succeed overall despite corrupt nest.
+    let plan = pipeline::run(&backend(), &opts).expect("convert should succeed with skip");
+    assert_eq!(plan.nested_count(), 2, "plan still lists both nests");
+
+    let paths = list_file_paths(&backend(), &out).unwrap();
+    assert!(
+        paths.iter().any(|p| p.ends_with("good.7z")),
+        "good nested should be present: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p == "readme.txt"),
+        "passthrough should be present: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("corrupt")),
+        "corrupt nested must not be in output: {paths:?}"
+    );
+}

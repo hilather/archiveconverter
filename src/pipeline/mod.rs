@@ -118,8 +118,10 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         .filter(|e| e.action == ActionKind::ConvertNested)
         .collect();
 
+    let mut nested_converted = 0usize;
+    let mut nested_skipped = 0usize;
     if !nested.is_empty() {
-        convert_nested_size_aware(
+        let stats = convert_nested_size_aware(
             backend,
             &registry,
             opts,
@@ -131,10 +133,28 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
             max_workers,
             size_budget,
         )?;
+        nested_converted = stats.converted;
+        nested_skipped = stats.skipped;
+        if nested_skipped > 0 {
+            tracing::warn!(
+                converted = nested_converted,
+                skipped = nested_skipped,
+                "some nested archives were skipped (see earlier errors); they are not in the output"
+            );
+        }
     }
 
     if use_solid_pass {
         remove_dir_all_quiet(&outer_pass);
+    }
+
+    // Nothing left to pack (all nested failed and no passthroughs).
+    let staged_files = count_staged_files(&staging);
+    if staged_files == 0 {
+        return Err(Error::Other(format!(
+            "nothing to write: all {} nested archive(s) failed and there are no passthrough members",
+            nested.len()
+        )));
     }
 
     if let Some(parent) = opts.output.parent() {
@@ -155,10 +175,11 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         backend.test(&out_tmp)?;
         let listed = backend.list(&out_tmp)?;
         let files = listed.iter().filter(|e| !e.is_dir).count();
-        let expected = plan.passthrough_count() + plan.nested_count();
+        // Expected = passthrough + successfully converted nested (skipped corrupt omitted).
+        let expected = plan.passthrough_count() + nested_converted;
         if files != expected {
             return Err(Error::Other(format!(
-                "verify failed: expected {expected} files in output, found {files}"
+                "verify failed: expected {expected} files in output (passthrough + converted nested; {nested_skipped} skipped), found {files}"
             )));
         }
     }
@@ -171,9 +192,37 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         solid_single_pass = use_solid_pass,
         nested_workers = max_workers,
         nested_size_budget = size_budget,
+        nested_converted,
+        nested_skipped,
         "conversion complete"
     );
     Ok(())
+}
+
+fn count_staged_files(staging: &Path) -> usize {
+    walkdir::WalkDir::new(staging)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count()
+}
+
+/// Outcome of nested converts: successful members + soft-failed (corrupt/unreadable).
+struct NestedRunStats {
+    converted: usize,
+    skipped: usize,
+}
+
+fn log_nested_skip(source_path: &str, err: &str) {
+    tracing::error!(
+        path = %source_path,
+        error = %err,
+        "skipping nested archive (convert failed); it will NOT appear in the output archive"
+    );
+    // Always surface on stderr so operators see it even at default log levels.
+    eprintln!(
+        "warning: skipping nested archive '{source_path}': {err} (not included in output)"
+    );
 }
 
 fn log_stage(opts: &PipelineOptions, stage: &str, d: std::time::Duration) {
@@ -187,6 +236,8 @@ fn log_stage(opts: &PipelineOptions, stage: &str, d: std::time::Duration) {
 /// Nested convert jobs ordered **smallest packed size first**, admitted while
 /// `running_count < max_workers` and `running_sum + size <= size_budget`
 /// (a lone nest may exceed the budget).
+///
+/// Corrupt / unreadable nested archives are **skipped** (logged, not fatal).
 fn convert_nested_size_aware(
     backend: &dyn ArchiveBackend,
     registry: &ConverterRegistry,
@@ -198,15 +249,27 @@ fn convert_nested_size_aware(
     nested: &[&plan::PlannedEntry],
     max_workers: usize,
     size_budget: u64,
-) -> Result<()> {
+) -> Result<NestedRunStats> {
     // Materialize sources, then sort by packed size ascending.
     let mut jobs: Vec<NestedJob> = Vec::with_capacity(nested.len());
+    let mut stage_skipped = 0usize;
     for (index, entry) in nested.iter().enumerate() {
         let path = if use_solid_pass {
-            find_extracted(outer_pass, &entry.source_path)?
+            match find_extracted(outer_pass, &entry.source_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    log_nested_skip(&entry.source_path, &e.to_string());
+                    stage_skipped += 1;
+                    continue;
+                }
+            }
         } else {
             let p = job_root.join(format!("pre-{index:04}.7z"));
-            backend.extract_member(&opts.input, &entry.source_path, &p)?;
+            if let Err(e) = backend.extract_member(&opts.input, &entry.source_path, &p) {
+                log_nested_skip(&entry.source_path, &e.to_string());
+                stage_skipped += 1;
+                continue;
+            }
             p
         };
         // Prefer listing size; fall back to on-disk size after extract.
@@ -225,9 +288,17 @@ fn convert_nested_size_aware(
     }
     jobs.sort_by(|a, b| a.size.cmp(&b.size).then_with(|| a.index.cmp(&b.index)));
 
-    let max_workers = max_workers.max(1).min(jobs.len().max(1));
+    if jobs.is_empty() {
+        return Ok(NestedRunStats {
+            converted: 0,
+            skipped: stage_skipped,
+        });
+    }
+
+    let max_workers = max_workers.max(1).min(jobs.len());
     tracing::info!(
         nested = jobs.len(),
+        stage_skipped,
         max_workers,
         size_budget,
         smallest = jobs.first().map(|j| j.size).unwrap_or(0),
@@ -235,20 +306,22 @@ fn convert_nested_size_aware(
         "nested convert schedule (smallest-first, size-aware)"
     );
 
-    if max_workers == 1 {
-        return convert_nested_serial_ordered(backend, registry, opts, job_root, staging, jobs);
-    }
-
-    convert_nested_parallel_budget(
-        backend,
-        registry,
-        opts,
-        job_root,
-        staging,
-        jobs,
-        max_workers,
-        size_budget,
-    )
+    let mut stats = if max_workers == 1 {
+        convert_nested_serial_ordered(backend, registry, opts, job_root, staging, jobs)?
+    } else {
+        convert_nested_parallel_budget(
+            backend,
+            registry,
+            opts,
+            job_root,
+            staging,
+            jobs,
+            max_workers,
+            size_budget,
+        )?
+    };
+    stats.skipped += stage_skipped;
+    Ok(stats)
 }
 
 struct NestedJob {
@@ -266,7 +339,9 @@ fn convert_nested_serial_ordered(
     job_root: &Path,
     staging: &Path,
     jobs: Vec<NestedJob>,
-) -> Result<()> {
+) -> Result<NestedRunStats> {
+    let mut converted = 0usize;
+    let mut skipped = 0usize;
     for job in jobs {
         tracing::info!(
             path = %job.source_path,
@@ -275,7 +350,7 @@ fn convert_nested_serial_ordered(
             size = job.size,
             "converting nested 7z"
         );
-        convert_one_nested_from_file(
+        match convert_one_nested_from_file(
             backend,
             registry,
             opts,
@@ -284,10 +359,19 @@ fn convert_nested_serial_ordered(
             &job.path,
             &job.dest_path,
             staging,
-        )?;
+        ) {
+            Ok(()) => converted += 1,
+            Err(e) => {
+                log_nested_skip(&job.source_path, &e.to_string());
+                skipped += 1;
+            }
+        }
         let _ = fs::remove_file(&job.path);
     }
-    Ok(())
+    Ok(NestedRunStats {
+        converted,
+        skipped,
+    })
 }
 
 fn convert_nested_parallel_budget(
@@ -299,7 +383,7 @@ fn convert_nested_parallel_budget(
     jobs: Vec<NestedJob>,
     max_workers: usize,
     size_budget: u64,
-) -> Result<()> {
+) -> Result<NestedRunStats> {
     let total = jobs.len();
     let mut pending: VecDeque<NestedJob> = jobs.into();
     let opts = opts.clone();
@@ -310,7 +394,9 @@ fn convert_nested_parallel_budget(
     let mut running_count = 0usize;
     let mut running_sum = 0u64;
     let mut finished = 0usize;
-    let mut errors: Vec<String> = Vec::new();
+    let mut converted = 0usize;
+    let mut skipped = 0usize;
+    let mut fatal: Option<String> = None;
 
     thread::scope(|scope| {
         // Local admit+spawn helper closes over scope / channels.
@@ -384,21 +470,21 @@ fn convert_nested_parallel_budget(
         };
 
         if let Err(e) = try_spawn(&mut pending, &mut running_count, &mut running_sum) {
-            errors.push(e.to_string());
+            fatal = Some(e.to_string());
         }
 
-        while finished < total && errors.is_empty() {
+        while finished < total && fatal.is_none() {
             if running_count == 0 {
                 // Pending left but nothing admitted — force one (should be rare).
                 if pending.is_empty() {
                     break;
                 }
                 if let Err(e) = try_spawn(&mut pending, &mut running_count, &mut running_sum) {
-                    errors.push(e.to_string());
+                    fatal = Some(e.to_string());
                     break;
                 }
                 if running_count == 0 {
-                    errors.push("nested scheduler stalled with pending work".into());
+                    fatal = Some("nested scheduler stalled with pending work".into());
                     break;
                 }
             }
@@ -408,16 +494,20 @@ fn convert_nested_parallel_budget(
                     running_sum = running_sum.saturating_sub(size);
                     running_count = running_count.saturating_sub(1);
                     finished += 1;
-                    if let Err(e) = result {
-                        errors.push(format!("{src_name}: {e}"));
-                    } else if let Err(e) =
-                        try_spawn(&mut pending, &mut running_count, &mut running_sum)
+                    match result {
+                        Ok(()) => converted += 1,
+                        Err(e) => {
+                            log_nested_skip(&src_name, &e);
+                            skipped += 1;
+                        }
+                    }
+                    if let Err(e) = try_spawn(&mut pending, &mut running_count, &mut running_sum)
                     {
-                        errors.push(e.to_string());
+                        fatal = Some(e.to_string());
                     }
                 }
                 Err(_) => {
-                    errors.push("nested worker channel closed early".into());
+                    fatal = Some("nested worker channel closed early".into());
                     break;
                 }
             }
@@ -429,8 +519,12 @@ fn convert_nested_parallel_budget(
                 running_sum = running_sum.saturating_sub(size);
                 running_count = running_count.saturating_sub(1);
                 finished += 1;
-                if let Err(e) = result {
-                    errors.push(format!("{src_name}: {e}"));
+                match result {
+                    Ok(()) => converted += 1,
+                    Err(e) => {
+                        log_nested_skip(&src_name, &e);
+                        skipped += 1;
+                    }
                 }
             } else {
                 break;
@@ -439,10 +533,9 @@ fn convert_nested_parallel_budget(
         drop(done_tx);
     });
 
-    if !errors.is_empty() {
+    if let Some(e) = fatal {
         return Err(Error::Other(format!(
-            "size-aware nested convert failed: {}",
-            errors.join("; ")
+            "size-aware nested convert failed: {e}"
         )));
     }
     if finished != total {
@@ -450,7 +543,10 @@ fn convert_nested_parallel_budget(
             "size-aware nested convert incomplete: finished {finished}/{total}"
         )));
     }
-    Ok(())
+    Ok(NestedRunStats {
+        converted,
+        skipped,
+    })
 }
 
 fn find_extracted(root: &Path, member: &str) -> Result<PathBuf> {
@@ -516,38 +612,43 @@ fn convert_one_nested_from_file(
     }
     fs::create_dir_all(&nested_root)?;
 
-    let conv = registry
-        .get("7z-solid-to-nonsolid")
-        .ok_or_else(|| Error::Other("missing 7z converter".into()))?;
+    let result = (|| -> Result<()> {
+        let conv = registry
+            .get("7z-solid-to-nonsolid")
+            .ok_or_else(|| Error::Other("missing 7z converter".into()))?;
 
-    let mut ctx = ConvertContext::new(nested_root.join("convert"));
-    fs::create_dir_all(&ctx.temp_dir)?;
-    ctx.exclude = opts.exclude_inner.clone();
-    ctx.pack = PackOptions {
-        non_solid: true,
-        threads: opts.pack.threads,
-        level: opts.pack.level,
-    };
-    ctx.verify = false;
-    ctx.passthrough_nonsolid = opts.passthrough_nonsolid;
-    ctx.prefer_streaming = opts.prefer_streaming;
+        let mut ctx = ConvertContext::new(nested_root.join("convert"));
+        fs::create_dir_all(&ctx.temp_dir)?;
+        ctx.exclude = opts.exclude_inner.clone();
+        ctx.pack = PackOptions {
+            non_solid: true,
+            threads: opts.pack.threads,
+            level: opts.pack.level,
+        };
+        ctx.verify = false;
+        ctx.passthrough_nonsolid = opts.passthrough_nonsolid;
+        ctx.prefer_streaming = opts.prefer_streaming;
 
-    let t = Instant::now();
-    let output = conv.convert(backend, inner_in, &ctx)?;
-    log_stage(opts, "nested_convert", t.elapsed());
+        let t = Instant::now();
+        let output = conv.convert(backend, inner_in, &ctx)?;
+        log_stage(opts, "nested_convert", t.elapsed());
 
-    if !is_safe_member_path(dest_member) {
-        return Err(Error::Other(format!(
-            "unsafe destination path: {dest_member}"
-        )));
-    }
-    let dest = staging.join(dest_member);
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    persist_file(&output.path, &dest)?;
+        if !is_safe_member_path(dest_member) {
+            return Err(Error::Other(format!(
+                "unsafe destination path: {dest_member}"
+            )));
+        }
+        let dest = staging.join(dest_member);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        persist_file(&output.path, &dest)?;
+        Ok(())
+    })();
+
+    // Always scrub per-nested temp, including on convert failure (corrupt archive).
     remove_dir_all_quiet(&nested_root);
-    Ok(())
+    result
 }
 
 /// Convert a single (non-nested) 7z archive to non-solid.
