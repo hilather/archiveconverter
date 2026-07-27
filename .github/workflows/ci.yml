@@ -5,6 +5,7 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -93,3 +94,28 @@ jobs:
           cargo build --release --bin archiveconverter --bin bench_nested
           ./target/release/bench_nested all --scale tiny --threads 1,2 --force
           cat benchdata/tiny/results/results.md
+
+  # Optional multi-minute tool vs manual 7z (fair one-at-a-time). Not on every PR.
+  large-compare:
+    name: Large CLI comparison (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install 7zz
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/7z.tar.xz "https://www.7-zip.org/a/7z2501-linux-x64.tar.xz"
+          tar -xOf /tmp/7z.tar.xz 7zz > "$HOME/.local/bin/7zz"
+          chmod +x "$HOME/.local/bin/7zz"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run large comparison
+        env:
+          LARGE_BENCH_FILES: "200000"
+          LARGE_BENCH_NESTED: "3"
+          LARGE_BENCH_MIN_SECS: "90"
+        run: |
+          cargo test --release --test compare_7z_cli large_tool_vs_manual \
+            -- --ignored --nocapture

@@ -4,6 +4,8 @@ use super::{ConvertContext, ConvertOutput, Converter};
 use crate::archive::detect::format_from_path;
 use crate::archive::{ArchiveBackend, ArchiveFormat, EntryMeta};
 use crate::error::{Error, Result};
+use crate::util::auto_threads::{file_stats, resolve_pack_threads};
+use crate::util::cleanup::remove_dir_all_fast;
 use crate::util::pathnorm::{is_safe_member_path, normalize_member_path};
 use crate::util::temp::remove_dir_all_quiet;
 use std::fs;
@@ -46,20 +48,75 @@ impl Converter for SevenZSolidToNonSolid {
         if work.exists() {
             remove_dir_all_quiet(&work);
         }
-        fs::create_dir_all(&tree)?;
+        fs::create_dir_all(&work)?;
 
+        let solid = backend.is_solid(input).unwrap_or(true);
         let filter_active = !ctx.exclude.is_empty();
 
-        // Listing 1M members via `7z l -slt` is ~5s and ~175MB of text. Skip when
-        // there is nothing to filter; extract+pack still yields a correct non-solid archive.
-        let entries = if filter_active {
+        // --- Fast path: already non-solid, no filters → copy through ---
+        if !solid && !filter_active && ctx.passthrough_nonsolid {
+            tracing::info!(
+                input = %input.display(),
+                "nested already non-solid; passthrough (no recompress)"
+            );
+            fs::copy(input, &out)?;
+            if ctx.verify {
+                backend.test(&out)?;
+            }
+            tracing::debug!(
+                stage = "convert_total",
+                ms = total_start.elapsed().as_millis() as u64,
+                passthrough = true,
+                "non-solid passthrough finished"
+            );
+            return Ok(ConvertOutput { path: out });
+        }
+
+        // --- Native streaming path: no full extract tree ---
+        if ctx.prefer_streaming {
+            let mut pack_opts = ctx.pack.clone();
+            pack_opts.non_solid = true;
+            match backend.convert_to_nonsolid_streaming(input, &out, &ctx.exclude, &pack_opts) {
+                Ok(true) => {
+                    if ctx.verify {
+                        backend.test(&out)?;
+                    }
+                    tracing::debug!(
+                        stage = "convert_total",
+                        ms = total_start.elapsed().as_millis() as u64,
+                        streaming = true,
+                        "native streaming convert finished"
+                    );
+                    return Ok(ConvertOutput { path: out });
+                }
+                Ok(false) => {
+                    tracing::debug!("backend has no streaming convert; falling back to extract+pack");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "streaming convert failed; falling back to extract+pack"
+                    );
+                }
+            }
+        }
+
+        fs::create_dir_all(&tree)?;
+
+        // Listing: only when we need filters and cannot map them to 7z -x! globs,
+        // or for auto-thread stats when no listing yet.
+        let globs = ctx.exclude.try_7z_exclude_globs();
+        let use_7z_excludes = filter_active && globs.as_ref().is_some_and(|g| !g.is_empty());
+        let need_post_filter = filter_active && !use_7z_excludes;
+
+        let entries = if need_post_filter || (ctx.pack.threads.is_none() && filter_active) {
             let t = Instant::now();
             let entries = backend.list(input)?;
             tracing::debug!(
                 stage = "list",
                 ms = t.elapsed().as_millis() as u64,
                 members = entries.iter().filter(|e| !e.is_dir).count(),
-                "listed archive for filtering"
+                "listed archive"
             );
             Some(entries)
         } else {
@@ -75,6 +132,7 @@ impl Converter for SevenZSolidToNonSolid {
                 .count();
             tracing::info!(
                 input = %input.display(),
+                solid,
                 total = entries.iter().filter(|e| !e.is_dir).count(),
                 kept,
                 "converting 7z to non-solid"
@@ -82,58 +140,85 @@ impl Converter for SevenZSolidToNonSolid {
         } else {
             tracing::info!(
                 input = %input.display(),
-                "converting 7z to non-solid (no member filters; skipping pre-list)"
+                solid,
+                use_7z_excludes,
+                "converting 7z to non-solid"
             );
         }
 
-        // Extract whole archive then delete excluded paths (solid streams require sequential decode).
+        // Extract: prefer 7z -x! globs so excluded files never hit disk.
         let t = Instant::now();
-        backend.extract_all(input, &tree)?;
-        tracing::debug!(
-            stage = "extract",
-            ms = t.elapsed().as_millis() as u64,
-            "extracted archive to tree"
-        );
-
-        // Remove excluded / unsafe files from tree (only when filters are active).
-        if let Some(ref entries) = entries {
-            let t = Instant::now();
-            let mut removed = 0u64;
-            for e in entries.iter().filter(|e| !e.is_dir) {
-                let rel = normalize_member_path(&e.path);
-                let full = tree.join(&rel);
-                let keep_it = is_safe_member_path(&rel) && ctx.exclude.should_keep(&rel);
-                if !keep_it && full.exists() {
-                    tracing::debug!(path = %rel, "removing excluded member");
-                    let _ = fs::remove_file(&full);
-                    removed += 1;
-                }
-            }
-            if removed > 0 {
-                prune_empty_dirs(&tree)?;
-            }
+        if use_7z_excludes {
+            let g = globs.unwrap();
+            backend.extract_all_with_excludes(input, &tree, &g)?;
             tracing::debug!(
-                stage = "filter_tree",
+                stage = "extract",
                 ms = t.elapsed().as_millis() as u64,
-                removed,
-                "applied member filters to tree"
+                excludes = g.len(),
+                "extracted with 7z -x! globs"
+            );
+        } else {
+            backend.extract_all(input, &tree)?;
+            tracing::debug!(
+                stage = "extract",
+                ms = t.elapsed().as_millis() as u64,
+                "extracted archive to tree"
             );
         }
 
+        // Post-filter only when 7z globs could not express the filter.
+        if need_post_filter {
+            if let Some(ref entries) = entries {
+                let t = Instant::now();
+                let mut removed = 0u64;
+                for e in entries.iter().filter(|e| !e.is_dir) {
+                    let rel = normalize_member_path(&e.path);
+                    let full = tree.join(&rel);
+                    let keep_it = is_safe_member_path(&rel) && ctx.exclude.should_keep(&rel);
+                    if !keep_it && full.exists() {
+                        let _ = fs::remove_file(&full);
+                        removed += 1;
+                    }
+                }
+                if removed > 0 {
+                    prune_empty_dirs(&tree)?;
+                }
+                tracing::debug!(
+                    stage = "filter_tree",
+                    ms = t.elapsed().as_millis() as u64,
+                    removed,
+                    "post-filter removed members"
+                );
+            }
+        }
+
+        // Auto thread policy when not explicit.
         let mut pack_opts = ctx.pack.clone();
         pack_opts.non_solid = true;
+        if pack_opts.threads.is_none() {
+            if let Some(ref entries) = entries {
+                let (n, bytes) = file_stats(entries);
+                pack_opts.threads = resolve_pack_threads(None, n, bytes);
+            } else {
+                // Cheap listing for stats only when we skipped it earlier.
+                if let Ok(listed) = backend.list(input) {
+                    let (n, bytes) = file_stats(&listed);
+                    pack_opts.threads = resolve_pack_threads(None, n, bytes);
+                }
+            }
+        }
+
         let t = Instant::now();
         backend.pack_dir(&tree, &out, &pack_opts)?;
         tracing::debug!(
             stage = "pack",
             ms = t.elapsed().as_millis() as u64,
+            threads = ?pack_opts.threads,
             "packed non-solid archive"
         );
 
-        // Drop the unpacked tree as soon as packing finishes so peak disk falls earlier
-        // (especially important before the caller copies the result and cleans the job dir).
         let t = Instant::now();
-        remove_dir_all_quiet(&tree);
+        remove_dir_all_fast(&tree);
         tracing::debug!(
             stage = "cleanup_tree",
             ms = t.elapsed().as_millis() as u64,
@@ -168,7 +253,6 @@ fn prune_empty_dirs(root: &Path) -> Result<()> {
         .filter(|e| e.file_type().is_dir())
         .map(|e| e.into_path())
         .collect();
-    // deepest first already via contents_first
     for d in dirs.drain(..) {
         if d == root {
             continue;

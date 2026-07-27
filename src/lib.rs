@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod cli;
+pub mod codec;
 pub mod convert;
 pub mod error;
 pub mod filter;

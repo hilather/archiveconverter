@@ -31,6 +31,32 @@ export PATH="$HOME/.local/bin:$PATH"
 cargo build --release
 ```
 
+## Backends
+
+| Backend | Flag | Engine |
+|---------|------|--------|
+| **CLI** (default) | `--backend cli` | Official `7zz`/`7z` subprocesses |
+| **Native** (Phase 1–3) | `--backend native` | [`sevenz-rust2`](https://crates.io/crates/sevenz-rust2) + optional **liblzma** |
+
+Native path **streams solid → non-solid** without unpacking a full file tree:
+
+| Phase | Pipeline (`--native-pipeline`) | Notes |
+|-------|--------------------------------|--------|
+| 1 | `sequential` | Decode then encode each entry |
+| 2 | `ahead` / `ahead:N` | Decode-ahead queue + size-aware MT LZMA2 |
+| 3 | `parallel` (default) | Windowed parallel LZMA2 → **stream** packs (not whole archive in RAM) |
+
+Codec for Phase 3: `--native-codec liblzma` (default) or `pure-rust`.
+
+```bash
+archiveconverter convert-single solid.7z -o out.7z --backend native --threads 4 --level 1
+archiveconverter convert-single solid.7z -o out.7z --backend native \
+  --native-pipeline parallel --native-codec liblzma
+archiveconverter convert outer.7z -o out.7z --backend native \
+  --native-pipeline ahead:2 --native-large-threshold 524288
+archiveconverter backend
+```
+
 ## CI & releases
 
 GitHub Actions (`.github/workflows/`):
@@ -138,6 +164,38 @@ Fixtures and results: `benchdata/<scale>/` (gitignored). Full-run notes:
 **Finding on million-tiny-file workloads:** `--threads 1` is often *faster* than
 2–4; multi-threaded LZMA does not help when per-file work is tiny and nested
 archives convert serially.
+
+### Tool vs manual 7z (fair one-at-a-time)
+
+```bash
+# Fast correctness + short timing (CI)
+cargo test --test compare_7z_cli -- --nocapture
+
+# Multi-minute load (both paths one nested at a time; ignored by default)
+cargo test --release --test compare_7z_cli large_tool_vs_manual \
+  -- --ignored --nocapture
+# Optional knobs:
+# LARGE_BENCH_FILES=280000 LARGE_BENCH_NESTED=3 LARGE_BENCH_MIN_SECS=120
+```
+
+Speed-up ideas: see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+### Performance features (defaults on where safe)
+
+| Feature | Flag |
+|---------|------|
+| Solid outer single-pass extract | default; `--no-solid-single-pass` |
+| Passthrough already-non-solid nested | default; `--no-passthrough-nonsolid` |
+| Auto pack threads (tiny files → 1) | omit `--threads` |
+| Extract/convert overlap prefetch | default; `--no-pipeline-overlap` |
+| Size-aware nested parallel | default: up to `--threads` workers, `--nested-size-budget 500M` |
+| Cap nested workers | `--nested-concurrency N` (`0` = auto from threads) |
+| Exclude via 7z `-x!` when regex maps | automatic for `\.ext$`, `^prefix/` |
+| Stage timings | `--profile` |
+| Native parallel codec (Phase 3) | `--backend native` + `--native-pipeline parallel` |
+| Native LZMA2 engine | `--native-codec liblzma` \| `pure-rust` |
+
+Details: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## License
 

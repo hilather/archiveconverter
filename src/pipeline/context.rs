@@ -1,7 +1,8 @@
 //! Runtime options for the conversion pipeline.
 
-use crate::filter::{MemberFilter, NameTransformer};
 use crate::archive::PackOptions;
+use crate::filter::{MemberFilter, NameTransformer};
+use crate::util::DEFAULT_NESTED_SIZE_BUDGET;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -15,9 +16,23 @@ pub struct PipelineOptions {
     pub keep_temp: bool,
     pub verify: bool,
     pub dry_run: bool,
-    /// Nested archive conversions run one at a time (disk efficiency).
+    /// Max concurrent nested conversions (`0` = auto from `--threads` / CPU count).
     pub nested_concurrency: usize,
+    /// Max sum of **packed** sizes of nested archives in flight together.
+    /// Default 500 MiB. `0` = no size cap (workers only). A single nest larger
+    /// than the budget still runs alone.
+    pub nested_size_budget: u64,
     pub pack: PackOptions,
+    /// Solid outers: extract needed members in one 7z pass.
+    pub solid_single_pass: bool,
+    /// Skip recompress when nested is already non-solid and filters empty.
+    pub passthrough_nonsolid: bool,
+    /// Prefetch next nested extract while converting current (serial path).
+    pub pipeline_overlap: bool,
+    /// Emit stage timings at info level.
+    pub profile: bool,
+    /// Prefer native streaming convert (no full extract tree) when backend supports it.
+    pub prefer_streaming: bool,
 }
 
 impl PipelineOptions {
@@ -32,8 +47,14 @@ impl PipelineOptions {
             keep_temp: false,
             verify: false,
             dry_run: false,
-            nested_concurrency: 1,
+            nested_concurrency: 0, // auto
+            nested_size_budget: DEFAULT_NESTED_SIZE_BUDGET,
             pack: PackOptions::default(),
+            solid_single_pass: true,
+            passthrough_nonsolid: true,
+            pipeline_overlap: true,
+            profile: false,
+            prefer_streaming: false,
         }
     }
 }

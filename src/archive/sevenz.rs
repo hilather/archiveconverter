@@ -89,12 +89,28 @@ impl SevenZCli {
         Ok(output)
     }
 
-    /// Parse `7z l -slt` technical listing.
+    /// Parse `7z l -slt` technical listing (richer, heavier).
     pub fn list_technical(&self, archive: &Path) -> Result<Vec<EntryMeta>> {
         let archive_s = archive.to_string_lossy();
         let output = self.run_checked(&["l", "-slt", "-ba", archive_s.as_ref()])?;
         let text = String::from_utf8_lossy(&output.stdout);
         parse_slt_listing(&text)
+    }
+
+    /// Cheaper listing via `7z l -ba` (name + size; good enough for filters/stats).
+    pub fn list_basic(&self, archive: &Path) -> Result<Vec<EntryMeta>> {
+        let archive_s = archive.to_string_lossy();
+        let output = self.run_checked(&["l", "-ba", archive_s.as_ref()])?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        parse_ba_listing(&text)
+    }
+
+    /// Archive-level properties (`7z l -slt` without `-ba` so the archive header is present).
+    pub fn archive_is_solid(&self, archive: &Path) -> Result<bool> {
+        let archive_s = archive.to_string_lossy();
+        let output = self.run_checked(&["l", "-slt", archive_s.as_ref()])?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_archive_solid(&text))
     }
 }
 
@@ -104,7 +120,38 @@ impl ArchiveBackend for SevenZCli {
     }
 
     fn list(&self, archive: &Path) -> Result<Vec<EntryMeta>> {
-        self.list_technical(archive)
+        // Prefer compact listing; fall back to technical if parse yields nothing.
+        match self.list_basic(archive) {
+            Ok(v) if !v.is_empty() => Ok(v),
+            Ok(_) => self.list_technical(archive),
+            Err(_) => self.list_technical(archive),
+        }
+    }
+
+    fn is_solid(&self, archive: &Path) -> Result<bool> {
+        self.archive_is_solid(archive)
+    }
+
+    fn extract_members(&self, archive: &Path, members: &[&str], dest_dir: &Path) -> Result<()> {
+        if members.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(dest_dir)?;
+        let archive_s = archive.to_string_lossy().into_owned();
+        let out_s = format!("-o{}", dest_dir.display());
+        // One 7z invocation: solid archives decode the solid stream once.
+        let mut args: Vec<String> = vec![
+            "x".into(),
+            "-y".into(),
+            out_s,
+            archive_s,
+        ];
+        for m in members {
+            args.push((*m).to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.run_checked(&arg_refs)?;
+        Ok(())
     }
 
     fn extract_member(&self, archive: &Path, member: &str, dest_file: &Path) -> Result<()> {
@@ -157,6 +204,27 @@ impl ArchiveBackend for SevenZCli {
         let archive_s = archive.to_string_lossy();
         let out_s = format!("-o{}", dest_dir.display());
         self.run_checked(&["x", "-y", out_s.as_str(), archive_s.as_ref()])?;
+        Ok(())
+    }
+
+    fn extract_all_with_excludes(
+        &self,
+        archive: &Path,
+        dest_dir: &Path,
+        exclude_globs: &[String],
+    ) -> Result<()> {
+        if exclude_globs.is_empty() {
+            return self.extract_all(archive, dest_dir);
+        }
+        fs::create_dir_all(dest_dir)?;
+        let archive_s = archive.to_string_lossy().into_owned();
+        let out_s = format!("-o{}", dest_dir.display());
+        let mut args: Vec<String> = vec!["x".into(), "-y".into(), out_s, archive_s];
+        for g in exclude_globs {
+            args.push(format!("-x!{g}"));
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.run_checked(&arg_refs)?;
         Ok(())
     }
 
@@ -241,6 +309,78 @@ fn find_extracted_file(root: &Path, member: &str) -> Result<PathBuf> {
         }
     }
     Err(Error::EntryNotFound(member.to_string()))
+}
+
+/// Parse archive-level `Solid = +` from full `7z l -slt` output (not `-ba`).
+pub fn parse_archive_solid(text: &str) -> bool {
+    // Prefer the archive header block (before the `----------` member separator).
+    let header = text.split("----------").next().unwrap_or(text);
+    for line in header.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Solid = ") {
+            let v = rest.trim();
+            return v == "+" || v.eq_ignore_ascii_case("true") || v == "1";
+        }
+    }
+    // Fallback: any Solid = + in the file (some 7z builds place it differently).
+    text.lines().any(|line| {
+        let line = line.trim();
+        line == "Solid = +" || line.eq_ignore_ascii_case("Solid = true")
+    })
+}
+
+/// Parse `7z l -ba` lines into entries.
+///
+/// Columns: date time attr size [compressed] name…
+/// For solid archives, packed size is often blank so only one number appears before the name.
+pub fn parse_ba_listing(text: &str) -> Result<Vec<EntryMeta>> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with("----") || line.starts_with("Date ") {
+            continue;
+        }
+        if line.contains(" files") && (line.contains("folder") || line.contains("folders")) {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Need at least: date time attr size name
+        if parts.len() < 5 {
+            continue;
+        }
+        let attr = parts[2];
+        // Attr looks like "....A" or "D...."
+        if attr.len() < 4 {
+            continue;
+        }
+        let is_dir = attr.starts_with('D');
+        let size: u64 = match parts[3].parse() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // parts[4] may be packed size (digits) or the start of the name
+        let name = if parts.len() >= 6 && parts[4].chars().all(|c| c.is_ascii_digit()) {
+            parts[5..].join(" ")
+        } else {
+            parts[4..].join(" ")
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let path = normalize_member_path(&name);
+        let format_hint = if is_dir {
+            ArchiveFormat::Unknown
+        } else {
+            format_from_path(&path)
+        };
+        entries.push(EntryMeta {
+            path,
+            size,
+            is_dir,
+            format_hint,
+        });
+    }
+    Ok(entries)
 }
 
 /// Parse `-slt` listing output into entries (files only; dirs optional).
@@ -349,6 +489,47 @@ Folder = +
         assert_eq!(entries[1].path, "nested/data.7z");
         assert_eq!(entries[1].format_hint, ArchiveFormat::SevenZ);
         assert!(entries[2].is_dir);
+    }
+
+    #[test]
+    fn parse_ba_sample() {
+        let sample = "\
+2024-01-01 12:00:00 ....A          12           10  file1.txt
+2024-01-01 12:00:00 ....A         999               nested/data.7z
+2024-01-01 12:00:00 D....           0            0  emptydir
+";
+        let entries = parse_ba_listing(sample).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "file1.txt");
+        assert_eq!(entries[0].size, 12);
+        assert!(!entries[0].is_dir);
+        assert_eq!(entries[1].path, "nested/data.7z");
+        assert_eq!(entries[1].format_hint, ArchiveFormat::SevenZ);
+        assert!(entries[2].is_dir);
+    }
+
+    #[test]
+    fn parse_solid_flag() {
+        let solid = r#"
+Path = outer.7z
+Type = 7z
+Solid = +
+Blocks = 1
+----------
+Path = a.7z
+Size = 1
+"#;
+        assert!(parse_archive_solid(solid));
+        let nonsolid = r#"
+Path = outer.7z
+Type = 7z
+Solid = -
+Blocks = 3
+----------
+Path = a.7z
+Size = 1
+"#;
+        assert!(!parse_archive_solid(nonsolid));
     }
 
     #[test]

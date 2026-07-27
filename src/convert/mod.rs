@@ -16,6 +16,10 @@ pub struct ConvertContext {
     pub temp_dir: PathBuf,
     /// When true, run `7z t` on the result.
     pub verify: bool,
+    /// When true, copy already-non-solid archives without recompressing (if no filters).
+    pub passthrough_nonsolid: bool,
+    /// Prefer backend streaming solid→non-solid (no full tree) when available.
+    pub prefer_streaming: bool,
 }
 
 impl ConvertContext {
@@ -25,6 +29,8 @@ impl ConvertContext {
             pack: PackOptions::default(),
             temp_dir,
             verify: false,
+            passthrough_nonsolid: true,
+            prefer_streaming: false,
         }
     }
 }

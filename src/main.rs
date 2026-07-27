@@ -1,10 +1,10 @@
-use archiveconverter::archive::sevenz::SevenZCli;
-use archiveconverter::archive::PackOptions;
+use archiveconverter::archive::native::NativeOptions;
+use archiveconverter::archive::{open_backend_with, PackOptions};
 use archiveconverter::cli::{Cli, Commands};
 use archiveconverter::convert::ConverterRegistry;
 use archiveconverter::error::Result;
 use archiveconverter::filter::MemberFilter;
-use archiveconverter::pipeline::{self, convert_single};
+use archiveconverter::pipeline::{self, convert_single_ex};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -30,9 +30,18 @@ fn try_main() -> Result<()> {
 
     match cli.command {
         Commands::Backend => {
-            let backend = SevenZCli::discover()?;
-            println!("{}", backend.version_line()?);
-            println!("binary: {}", backend.binary().display());
+            match archiveconverter::archive::sevenz::SevenZCli::discover() {
+                Ok(c) => {
+                    println!("cli: {}", c.version_line()?);
+                    println!("cli binary: {}", c.binary().display());
+                }
+                Err(e) => println!("cli: unavailable ({e})"),
+            }
+            let n = NativeOptions::default();
+            println!(
+                "native: sevenz-rust2 (pipeline={:?}, large_threshold={}, decode_threads={})",
+                n.pipeline, n.large_file_threshold, n.decode_threads
+            );
             Ok(())
         }
         Commands::ListConverters => {
@@ -45,30 +54,34 @@ fn try_main() -> Result<()> {
             Ok(())
         }
         Commands::Convert(args) => {
-            let backend = SevenZCli::discover()?;
+            let backend =
+                open_backend_with(args.backend_kind(), args.native_options()?)?;
             let opts = args.to_pipeline_options()?;
-            let plan = pipeline::run(&backend, &opts)?;
+            tracing::info!(backend = args.backend_kind().as_str(), "using archive backend");
+            let plan = pipeline::run(backend.as_ref(), &opts)?;
             if !opts.dry_run {
                 println!(
-                    "Wrote {} (nested={}, passthrough={}, skipped={})",
+                    "Wrote {} (nested={}, passthrough={}, skipped={}, backend={})",
                     opts.output.display(),
                     plan.nested_count(),
                     plan.passthrough_count(),
-                    plan.skip_count()
+                    plan.skip_count(),
+                    args.backend_kind().as_str(),
                 );
             }
             Ok(())
         }
         Commands::ConvertSingle(args) => {
-            let backend = SevenZCli::discover()?;
+            let backend =
+                open_backend_with(args.backend_kind(), args.native_options()?)?;
             let exclude = MemberFilter::with_excludes(&args.exclude)?;
             let pack = PackOptions {
                 non_solid: true,
                 threads: args.threads,
                 level: args.level,
             };
-            convert_single(
-                &backend,
+            convert_single_ex(
+                backend.as_ref(),
                 &args.input,
                 &args.output,
                 &exclude,
@@ -76,8 +89,13 @@ fn try_main() -> Result<()> {
                 args.verify,
                 args.temp_dir.as_deref(),
                 args.keep_temp,
+                true,
             )?;
-            println!("Wrote {}", args.output.display());
+            println!(
+                "Wrote {} (backend={})",
+                args.output.display(),
+                args.backend_kind().as_str()
+            );
             Ok(())
         }
     }

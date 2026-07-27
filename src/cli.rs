@@ -1,11 +1,30 @@
 //! Command-line interface.
 
-use crate::archive::PackOptions;
+use crate::archive::native::{NativeOptions, NativePipeline, DEFAULT_LARGE_FILE_THRESHOLD};
+use crate::archive::{BackendKind, PackOptions};
+use crate::codec::CodecKind;
 use crate::error::{Error, Result};
 use crate::filter::{MemberFilter, NameTransformer};
 use crate::pipeline::PipelineOptions;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliBackend {
+    /// Official 7zz/7z CLI
+    Cli,
+    /// Pure-Rust sevenz-rust2 (streaming solid→non-solid)
+    Native,
+}
+
+impl From<CliBackend> for BackendKind {
+    fn from(v: CliBackend) -> Self {
+        match v {
+            CliBackend::Cli => BackendKind::Cli,
+            CliBackend::Native => BackendKind::Native,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -79,13 +98,50 @@ pub struct ConvertArgs {
     #[arg(long, default_value_t = 5)]
     pub level: u32,
 
-    /// Thread count for 7z (-mmt); omit for -mmt=on
+    /// Thread count for 7z / nested worker auto-count; omit for auto
     #[arg(long)]
     pub threads: Option<u32>,
 
-    /// Nested conversion concurrency (v1: only 1 is used for disk safety)
-    #[arg(long, default_value_t = 1)]
+    /// Max concurrent nested conversions (`0` = auto from --threads / CPUs)
+    #[arg(long, default_value_t = 0)]
     pub nested_concurrency: usize,
+
+    /// Max total packed size of nested archives converting at once
+    /// (default `500M`). `0` = no size cap. Example: `500M`, `1G`, `524288000`.
+    #[arg(long, default_value = "500M")]
+    pub nested_size_budget: String,
+
+    /// Disable solid-order single-pass outer extract (for A/B comparison).
+    #[arg(long = "no-solid-single-pass")]
+    pub no_solid_single_pass: bool,
+
+    /// Always recompress nested archives even if already non-solid
+    #[arg(long = "no-passthrough-nonsolid")]
+    pub no_passthrough_nonsolid: bool,
+
+    /// Disable extract/convert overlap prefetch
+    #[arg(long = "no-pipeline-overlap")]
+    pub no_pipeline_overlap: bool,
+
+    /// Log stage timings at info level
+    #[arg(long)]
+    pub profile: bool,
+
+    /// 7z engine: `cli` (default) or `native` (pure Rust / streaming)
+    #[arg(long, value_enum, default_value_t = CliBackend::Cli)]
+    pub backend: CliBackend,
+
+    /// Native only: pipeline mode: `parallel` (default), `ahead:N`, or `sequential`
+    #[arg(long, default_value = "parallel")]
+    pub native_pipeline: String,
+
+    /// Native only: size (bytes) above which a file uses multi-threaded LZMA2
+    #[arg(long, default_value_t = DEFAULT_LARGE_FILE_THRESHOLD)]
+    pub native_large_threshold: u64,
+
+    /// Native only: LZMA2 codec `liblzma` (default) or `pure-rust`
+    #[arg(long, default_value = "liblzma")]
+    pub native_codec: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -105,6 +161,69 @@ pub struct ConvertSingleArgs {
     pub level: u32,
     #[arg(long)]
     pub threads: Option<u32>,
+    /// 7z engine: `cli` or `native`
+    #[arg(long, value_enum, default_value_t = CliBackend::Cli)]
+    pub backend: CliBackend,
+    /// Native pipeline: `parallel` | `sequential` | `ahead` | `ahead:N`
+    #[arg(long, default_value = "parallel")]
+    pub native_pipeline: String,
+    /// Native only: MT LZMA2 threshold in bytes
+    #[arg(long, default_value_t = DEFAULT_LARGE_FILE_THRESHOLD)]
+    pub native_large_threshold: u64,
+    /// Native LZMA2 codec: `liblzma` | `pure-rust`
+    #[arg(long, default_value = "liblzma")]
+    pub native_codec: String,
+}
+
+/// Build NativeOptions from shared CLI knobs.
+pub fn native_options_from(
+    pipeline: &str,
+    large_threshold: u64,
+    encode_threads: Option<u32>,
+    codec: &str,
+) -> Result<NativeOptions> {
+    let mut o = NativeOptions::default();
+    o.pipeline = parse_pipeline(pipeline)?;
+    o.large_file_threshold = large_threshold;
+    o.encode_threads = encode_threads;
+    o.codec = CodecKind::parse(codec).ok_or_else(|| {
+        Error::Other(format!(
+            "unknown --native-codec '{codec}' (use liblzma or pure-rust)"
+        ))
+    })?;
+    Ok(o)
+}
+
+fn parse_pipeline(s: &str) -> Result<NativePipeline> {
+    let s = s.trim().to_ascii_lowercase();
+    if s == "parallel" || s == "parallel-codec" || s == "p3" {
+        return Ok(NativePipeline::ParallelCodec);
+    }
+    if s == "sequential" || s == "seq" || s == "0" {
+        return Ok(NativePipeline::Sequential);
+    }
+    if s == "ahead" || s == "pipeline" {
+        return Ok(NativePipeline::DecodeAhead { depth: 2 });
+    }
+    if let Some(rest) = s.strip_prefix("ahead:") {
+        let depth: usize = rest.parse().map_err(|_| {
+            Error::Other(format!("invalid --native-pipeline depth in '{s}'"))
+        })?;
+        return Ok(NativePipeline::DecodeAhead {
+            depth: depth.max(1),
+        });
+    }
+    // numeric only = ahead depth
+    if let Ok(depth) = s.parse::<usize>() {
+        return Ok(if depth == 0 {
+            NativePipeline::Sequential
+        } else {
+            NativePipeline::DecodeAhead { depth }
+        });
+    }
+    Err(Error::Other(format!(
+        "unknown --native-pipeline '{s}' (parallel|sequential|ahead|ahead:N)"
+    )))
 }
 
 impl ConvertArgs {
@@ -127,12 +246,47 @@ impl ConvertArgs {
         opts.keep_temp = self.keep_temp;
         opts.verify = self.verify;
         opts.dry_run = self.dry_run;
-        opts.nested_concurrency = self.nested_concurrency.max(1);
+        opts.nested_concurrency = self.nested_concurrency;
+        opts.nested_size_budget = crate::util::parse_byte_size(&self.nested_size_budget)?;
+        opts.solid_single_pass = !self.no_solid_single_pass;
+        opts.passthrough_nonsolid = !self.no_passthrough_nonsolid;
+        opts.pipeline_overlap = !self.no_pipeline_overlap;
+        opts.profile = self.profile;
+        // Native backend: prefer streaming solid→non-solid (no full tree).
+        opts.prefer_streaming = matches!(self.backend, CliBackend::Native);
         opts.pack = PackOptions {
             non_solid: true,
-            threads: self.threads,
+            threads: self.threads, // None → auto policy inside converter
             level: self.level,
         };
         Ok(opts)
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend.into()
+    }
+
+    pub fn native_options(&self) -> Result<NativeOptions> {
+        native_options_from(
+            &self.native_pipeline,
+            self.native_large_threshold,
+            self.threads,
+            &self.native_codec,
+        )
+    }
+}
+
+impl ConvertSingleArgs {
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend.into()
+    }
+
+    pub fn native_options(&self) -> Result<NativeOptions> {
+        native_options_from(
+            &self.native_pipeline,
+            self.native_large_threshold,
+            self.threads,
+            &self.native_codec,
+        )
     }
 }
