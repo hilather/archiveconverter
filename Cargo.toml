@@ -1,0 +1,36 @@
+[package]
+name = "archiveconverter"
+version = "0.1.0"
+edition = "2021"
+description = "Convert nested solid 7z archives to non-solid form with filtering and renaming"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hilather/archiveconverter"
+homepage = "https://github.com/hilather/archiveconverter"
+keywords = ["7z", "archive", "compression", "solid"]
+categories = ["command-line-utilities", "compression"]
+
+[[bin]]
+name = "archiveconverter"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench_nested"
+path = "src/bin/bench_nested.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.12.0"
+regex = "1"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+which = "7"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

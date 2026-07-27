@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install 7-Zip (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+          # Prefer official 7zz when available for closer parity with local benches
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/7z.tar.xz "https://www.7-zip.org/a/7z2501-linux-x64.tar.xz"
+          tar -xOf /tmp/7z.tar.xz 7zz > "$HOME/.local/bin/7zz"
+          chmod +x "$HOME/.local/bin/7zz"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          7zz | head -2 || 7z | head -2
+
+      - name: Install 7-Zip (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install p7zip || true
+          # p7zip provides 7z/7za
+          which 7z || which 7za
+          7z | head -2 || 7za | head -2
+
+      - name: Check
+        run: cargo check --all-targets
+
+      - name: Test
+        run: cargo test --all-targets -- --nocapture
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Smoke CLI
+        run: |
+          ./target/release/archiveconverter backend
+          ./target/release/archiveconverter list-converters
+          ./target/release/bench_nested scales
+
+  bench-compare:
+    name: CLI comparison bench (ubuntu)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install 7-Zip
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/7z.tar.xz "https://www.7-zip.org/a/7z2501-linux-x64.tar.xz"
+          tar -xOf /tmp/7z.tar.xz 7zz > "$HOME/.local/bin/7zz"
+          ln -sfn "$HOME/.local/bin/7zz" "$HOME/.local/bin/7z"
+          chmod +x "$HOME/.local/bin/7zz"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run comparison tests
+        run: cargo test --test compare_7z_cli -- --nocapture
+
+      - name: Quick nested bench
+        run: |
+          cargo build --release --bin archiveconverter --bin bench_nested
+          ./target/release/bench_nested all --scale tiny --threads 1,2 --force
+          cat benchdata/tiny/results/results.md
