@@ -1,23 +1,63 @@
 # archiveconverter
 
-Convert **nested solid 7z archives** to **non-solid** form, with regex exclude/rename, size-aware nested concurrency, and optional outer **7z / tar / directory** output.
+**Nested solid 7z → non-solid**, with filters, renames, size-aware concurrent nest conversion, and outer output as **7z**, **tar**, or a plain **directory**.
 
-## Why
+| | |
+|--|--|
+| **Status** | Active; CLI + library (`archiveconverter` crate) |
+| **License** | MIT |
+| **Repo** | [hilather/archiveconverter](https://github.com/hilather/archiveconverter) |
+| **Default engine** | Official 7-Zip CLI (`7zz` / `7z` / `7za`) |
+| **Optional engine** | Native `sevenz-rust2` + Phase 3 windowed parallel **liblzma** codec |
 
-Solid 7z archives (`-ms=on`, the default) pack many files into one compressed stream. Nested solid archives make selective or streaming access expensive. This tool rebuilds:
+Published benchmark tables: **[`docs/bench/RESULTS.md`](docs/bench/RESULTS.md)** · design notes: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) · agent rules: [`AGENTS.md`](AGENTS.md)
 
-- each **nested** `.7z` as non-solid (with optional member exclusion), and
-- the **outer** as non-solid **7z**, uncompressed **tar**, or a plain **directory** of first-layer members,
+---
 
-while controlling peak work via a **size-aware nested concurrency budget** (default 500 MiB of packed nests in flight).
+## What it does
+
+Solid 7z (`-ms=on`) packs many files into one compressed stream. Nested solid archives make random access and remounting expensive.
+
+Given an **outer** archive that embeds one or more solid `.7z` members, this tool:
+
+1. **Plans** outer members (skip / passthrough / convert nested)  
+2. **Converts** each nested solid 7z → non-solid (`-ms=off`), with optional excludes  
+3. **Writes** the first layer into an outer **non-solid 7z**, uncompressed **tar**, or **directory**  
+4. Keeps peak work bounded via **size-aware nested concurrency** (default 500 MiB packed nests in flight)
+
+Nested *content* is still compressed 7z; only the **outer container** and **solidity** of nested archives change.
+
+---
+
+## Feature overview (current)
+
+| Area | Capability |
+|------|------------|
+| **Outer formats** | `7z` (default, store/Copy append) · `tar` (uncompressed) · `dir` (no re-wrap) |
+| **Dir default name** | `--outer-format dir` without `-o` → `<input-dir>/<archive-stem>/` |
+| **Nested concurrency** | Smallest-first; workers from `--threads`; cap with `--nested-size-budget` / `--nested-concurrency` |
+| **Single nest** | Pack/encode threads forced to **1** (MT often slower on dense tiny files) |
+| **Outer writer** | Streaming append under a mutex — **no final recompress** of the outer |
+| **Solid outer extract** | Single-pass bulk extract of needed members (default) |
+| **Passthrough** | Already non-solid nested archives can be copied when filters are empty |
+| **Filters** | Regex exclude inner/outer; ordered rename rules; basename-only match |
+| **7z excludes** | Common regexes mapped to `7z -x!` globs when possible |
+| **Corrupt nests** | Skipped with a warning; rest of the outer still completes |
+| **Backends** | `cli` (default) or `native` (streaming Phase 1–3 pipelines) |
+| **Native Phase 3** | Windowed parallel LZMA2 (`liblzma` or pure-rust); packs stream out; bounded RAM |
+| **Headers** | Custom non-solid writers aligned for 7zz / sevenz-rust2 / common mounters |
+| **Bench harness** | `bench_nested` scales + **stored manual 7z baselines** at matching `-mmt=N` |
+
+---
 
 ## Requirements
 
-- Rust 1.70+ (edition 2021)
-- [7-Zip](https://www.7-zip.org/) CLI: `7zz`, `7z`, or `7za` on `PATH` (or `~/.local/bin/7zz`) for the default CLI backend
+- **Rust** 1.70+ (edition 2021)
+- **7-Zip CLI** on `PATH` for the default backend: `7zz`, `7z`, or `7za` (or `~/.local/bin/7zz`)
+- Native backend: no 7z required for pure in-process convert paths (CI still installs 7z for fixtures/tests)
 
 ```bash
-# Linux example (user-local static binary)
+# Linux: official 7zz (user-local)
 mkdir -p ~/.local/bin
 curl -fsSL -o /tmp/7z.tar.xz https://www.7-zip.org/a/7z2501-linux-x64.tar.xz
 tar -xOf /tmp/7z.tar.xz 7zz > ~/.local/bin/7zz
@@ -29,55 +69,19 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ```bash
 cargo build --release
+# binaries: target/release/archiveconverter  target/release/bench_nested
 ```
 
-## Backends
+---
 
-| Backend | Flag | Engine |
-|---------|------|--------|
-| **CLI** (default) | `--backend cli` | Official `7zz`/`7z` subprocesses |
-| **Native** (Phase 1–3) | `--backend native` | [`sevenz-rust2`](https://crates.io/crates/sevenz-rust2) + optional **liblzma** |
-
-Native path **streams solid → non-solid** without unpacking a full file tree:
-
-| Phase | Pipeline (`--native-pipeline`) | Notes |
-|-------|--------------------------------|--------|
-| 1 | `sequential` | Decode then encode each entry |
-| 2 | `ahead` / `ahead:N` | Decode-ahead queue + size-aware MT LZMA2 |
-| 3 | `parallel` (default) | Windowed parallel LZMA2 → **stream** packs (not whole archive in RAM) |
-
-Codec for Phase 3: `--native-codec liblzma` (default) or `pure-rust`.
+## Quick start
 
 ```bash
-archiveconverter convert-single solid.7z -o out.7z --backend native --threads 4 --level 1
-archiveconverter convert-single solid.7z -o out.7z --backend native \
-  --native-pipeline parallel --native-codec liblzma
-archiveconverter convert outer.7z -o out.7z --backend native \
-  --native-pipeline ahead:2 --native-large-threshold 524288
-archiveconverter backend
-```
-
-## CI & releases
-
-GitHub Actions (`.github/workflows/`):
-
-- **CI** on push/PR: `cargo test`, release build, CLI smoke, tiny nested bench, and
-  `tests/compare_7z_cli.rs` (correctness + timing vs a manual 7z CLI pipeline).
-- **Release** on tags `v*`: multi-target binaries uploaded to a GitHub Release.
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-## Usage
-
-```bash
-# Inspect backend
+# Inspect engines
 archiveconverter backend
 archiveconverter list-converters
 
-# Dry-run plan
+# Plan only
 archiveconverter convert outer.7z -o out.7z \
   --exclude-outer '^skip_me\.7z$' \
   --exclude-inner '(?i)\.tmp$' \
@@ -85,84 +89,144 @@ archiveconverter convert outer.7z -o out.7z \
   --rename '_old\.7z$=.7z' \
   --dry-run
 
-# Convert → non-solid outer 7z (default)
+# Nested convert → non-solid outer 7z
 archiveconverter convert outer.7z -o out.7z \
   --exclude-outer '^skip_me\.7z$' \
   --exclude-inner '(?i)\.tmp$' \
   --rename '_old\.7z$=.7z' \
-  --verify \
-  --level 5 \
-  --threads 4
+  --threads 4 --level 1 --verify
 
-# Outer as uncompressed tar (nested members stay non-solid .7z inside)
-archiveconverter convert outer.7z -o out.tar --outer-format tar --verify --level 1
-# or infer from extension:
-archiveconverter convert outer.7z -o out.tar --verify --level 1
+# Outer as uncompressed tar
+archiveconverter convert outer.7z -o out.tar --outer-format tar --level 1 --verify
+# extension alone also selects tar:
+archiveconverter convert outer.7z -o out.tar --level 1
 
-# First layer only: write members into a directory (no re-wrap)
-# Default dir = archive stem next to input: path/game.7z → path/game/
-archiveconverter convert path/game.7z --outer-format dir --verify --level 1
+# First layer only (no outer archive). Default dir = archive stem next to input.
+#   path/game.7z  →  path/game/
+archiveconverter convert path/game.7z --outer-format dir --level 1 --verify
 archiveconverter convert outer.7z -o /tmp/unpacked --outer-format dir --level 1
 
-# Single archive only (no nesting)
+# Single archive (no nesting)
 archiveconverter convert-single solid.7z -o nonsolid.7z --exclude '\.tmp$' --verify
+
+# Native Phase 3 (fast on tiny-file solid→non-solid)
+archiveconverter convert-single solid.7z -o out.7z \
+  --backend native --threads 4 --level 1 \
+  --native-pipeline parallel --native-codec liblzma
 ```
 
-### Flags
+---
 
-| Flag | Meaning |
-|------|---------|
-| `--outer-format 7z\|tar\|dir` | Outer container (`7z` default; `tar` = uncompressed; `dir` = first-layer files only). If omitted: `.tar` → tar; path ending in `/` → dir |
-| `-o PATH` | Output file (7z/tar) or directory (`dir`). For `dir`, defaults to `<input-dir>/<archive-stem>/` |
-| `--exclude-inner REGEX` | Drop matching paths **inside** each nested 7z |
-| `--exclude-outer REGEX` | Drop matching members of the **outer** archive |
-| `--rename PATTERN=REPL` | Rewrite outer member names (ordered; supports `$1` / `$name`) |
-| `--basename-match` | Match excludes against basename only |
-| `--dry-run` | Print plan only |
-| `--verify` | Entry-count check (7z / tar / directory as appropriate) |
-| `--temp-dir` / `--keep-temp` | Control temp workspace |
-| `--level` / `--threads` | Nested pack level / nest workers + pack MT (single nest forces pack threads=1) |
-| `--nested-concurrency N` | Max nests in flight (`0` = auto from threads/CPUs) |
-| `--nested-size-budget SIZE` | Max packed size of nests converting together (default `500M`; `0` = no cap) |
-| `--backend cli\|native` | 7z engine |
-| `--native-pipeline` / `--native-codec` | Native Phase 2/3 knobs |
-| `--profile` | Stage timings at info level |
+## CLI reference
 
-Path matching uses normalized `/` separators (Rust `regex` crate).
+### Commands
+
+| Command | Purpose |
+|---------|---------|
+| `convert` | Outer archive with nested 7z members |
+| `convert-single` | One 7z solid→non-solid (no outer nesting logic) |
+| `backend` | Print CLI / native backend info |
+| `list-converters` | Registered converters |
+
+### `convert` options
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-o`, `--output` | required for 7z/tar; optional for `dir` | Output file or directory |
+| `--outer-format` | inferred | `7z` \| `tar` \| `dir`. Omit: `.tar` → tar; path ends with `/` → dir; else 7z |
+| `--exclude-inner` | — | Regex; drop paths **inside** each nested 7z (repeatable) |
+| `--exclude-outer` | — | Regex; drop outer members (repeatable) |
+| `--rename` | — | `PATTERN=REPL` on outer names (ordered; `$1` / `$name`) |
+| `--basename-match` | off | Match excludes on basename only |
+| `--level` | `5` | Nested pack level 0–9 |
+| `--threads` | auto | Nest workers + pack MT when nests ≥ 2; single nest forces pack = 1 |
+| `--nested-concurrency` | `0` (auto) | Max nests converting at once |
+| `--nested-size-budget` | `500M` | Max sum of packed nest sizes in flight (`0` = no size cap) |
+| `--backend` | `cli` | `cli` \| `native` |
+| `--native-pipeline` | `parallel` | `parallel` \| `ahead[:N]` \| `sequential` |
+| `--native-codec` | `liblzma` | `liblzma` \| `pure-rust` (Phase 3) |
+| `--native-large-threshold` | 512 KiB | Size for MT LZMA2 on native encode |
+| `--verify` | off | Count/test output (7z / tar / dir) |
+| `--dry-run` | off | Print plan only |
+| `--temp-dir` / `--keep-temp` | system temp | Control workspace |
+| `--profile` | off | Stage timings at info |
+| `--no-solid-single-pass` | off | Disable bulk outer extract |
+| `--no-passthrough-nonsolid` | off | Always recompress non-solid nests |
+| `--no-pipeline-overlap` | off | Disable extract/convert prefetch |
+| `-v` / `-vv` | info | Debug / trace logging |
+
+Path matching uses `/`-normalized paths (Rust `regex`).
+
+### Outer formats
+
+| Format | How to select | Result |
+|--------|---------------|--------|
+| **7z** | default / `-o out.7z` | Non-solid outer; members stored (Copy), no recompress |
+| **tar** | `--outer-format tar` or `-o out.tar` | Uncompressed tar of first-layer members |
+| **dir** | `--outer-format dir` or `-o path/` | First-layer files only; nested still non-solid `.7z` |
+
+Dir default without `-o`: same directory as the input archive, **name = input file stem** (suffix stripped), e.g. `/data/game.7z` → `/data/game/`.
+
+---
 
 ## Architecture
 
-Extensible converter registry:
-
-- **v1:** `7z-solid-to-nonsolid` — extract → filter → pack `-ms=off` (or native stream)
-- **stub:** `zip-stub` — reserved for future ZIP conversion
-
-Pipeline:
-
-1. List outer → plan (skip / passthrough / convert nested)  
-2. Optional solid single-pass bulk extract of needed members  
-3. Convert nests with **size-aware concurrency** (smallest first; budget + worker caps)  
-4. Append finished members into outer **7z store / tar / directory** under a mutex (no final outer recompress)
-
-Corrupt nested archives are **skipped** (logged); they do not abort the whole job.
-
-## Tests
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-cargo test
+```text
+input outer.7z
+    │
+    ├─ list + plan (exclude / rename / convert-nested / passthrough / skip)
+    │
+    ├─ solid single-pass extract of needed members (when useful)
+    │
+    ├─ size-aware nest workers ──► each nest: solid→non-solid convert
+    │         (mutex)                      │
+    │                                      ▼
+    └─ SyncedOuterWriter ──────► outer 7z store | tar | directory
 ```
 
-Integration tests build solid nested fixtures with the 7z CLI.
+| Module | Role |
+|--------|------|
+| `pipeline` | Orchestration, nest scheduling, outer finalize |
+| `convert` | Registry; `7z-solid-to-nonsolid` (+ zip stub) |
+| `archive` | CLI + native backends |
+| `codec` | Store/tar/dir outer writers, Phase 3 LZMA2, headers |
+| `filter` | Exclude + rename |
+| `bin/bench_nested` | Fixture scales + timing + manual baselines |
 
-## Benchmarks
+**Disk model:** nested converts are concurrent only within the size budget; each nest’s unpack tree is scrubbed when done. Outer packs are appended, not rebuilt.
 
-Published numbers (tables + CSV): **[`docs/bench/RESULTS.md`](docs/bench/RESULTS.md)**  
-Index: [`docs/bench/SNAPSHOT.md`](docs/bench/SNAPSHOT.md) · knobs: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+**Failure model:** a corrupt nested archive is **skipped** (stderr warning + log); other members still land in the output.
 
-### Full nested matrix (summary)
+---
 
-Host: 12-thread i7-8750H, NVMe. ~1M tiny files per nest, `--level 1`, CLI backend, size-aware nested concurrency.
+## Backends
+
+| Backend | Flag | Notes |
+|---------|------|--------|
+| **CLI** | `--backend cli` (default) | Official 7zz/7z; production-safe parity with manual scripts |
+| **Native** | `--backend native` | In-process solid-order decode; no full tree for streaming paths |
+
+Native pipelines (`--native-pipeline`):
+
+| Value | Behavior |
+|-------|----------|
+| `parallel` (default) | Phase 3: windowed parallel LZMA2 → stream packs |
+| `ahead` / `ahead:N` | Phase 2: decode-ahead queue |
+| `sequential` | Phase 1: one entry at a time |
+
+Codec (`--native-codec`): `liblzma` (default, usually fastest) or `pure-rust`.
+
+On ~8k tiny-file solid→non-solid, Phase 3 liblzma is about **9×** faster than CLI extract+pack on the results host — see [RESULTS](docs/bench/RESULTS.md#phase-3-single-solidnonsolid-bake-off).
+
+---
+
+## Performance highlights
+
+Full tables: [`docs/bench/RESULTS.md`](docs/bench/RESULTS.md) · knobs & implementation checklist: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+
+### Full nested matrix (CLI backend, level 1)
+
+~1M tiny files per nest · size-aware concurrency · append-store outer · 12-thread laptop (2026-07-27)
 
 | nested | t=1 | t=2 | t=4 | t4 vs t1 |
 |-------:|----:|----:|----:|---------:|
@@ -171,71 +235,118 @@ Host: 12-thread i7-8750H, NVMe. ~1M tiny files per nest, `--level 1`, CLI backen
 | 4 | 896 s | 568 s | 400 s | **2.24×** |
 | 10 | 2351 s | 2756 s\* | 1147 s | **2.05×** |
 
-\*n=10 t=2 looks like an outlier. Single nest prefers 1 pack thread (tool forces this). Multi-nest benefits from concurrent workers.
+\*n=10 t=2 looks like an outlier. **Single nest → prefer 1 pack thread** (tool enforces this). **Multi-nest → workers help.**
 
-Other published results: large tool≈manual (~1.01× at threads=1), Phase 3 native liblzma ~**9×** vs CLI on 8k tiny files — see RESULTS.md.
+### Other published numbers
 
-### How to run benches
+| Suite | Result |
+|-------|--------|
+| Large tool vs manual 7z (280k×3, threads=1, one-at-a-time) | tool ≈ **1.01×** manual |
+| Phase 3 parallel liblzma vs CLI (8k files) | ~**0.11×** wall (~9× faster) |
+
+### Defaults that matter
+
+| Behavior | Default |
+|----------|---------|
+| Nested size budget | `500M` packed |
+| Nested workers | auto from `--threads` / CPUs |
+| Single nest pack threads | **1** always |
+| Outer container | non-solid **7z** store append |
+| Solid outer extract | single-pass on |
+| Non-solid nest passthrough | on when filters empty |
+
+---
+
+## Benchmarks (how to run)
 
 ```bash
 cargo build --release --bin archiveconverter --bin bench_nested
-./target/release/bench_nested scales            # list sizes
+./target/release/bench_nested scales
 ```
 
-| Scale | Files / nested | Content | Nested outers | Intent |
-|-------|----------------|---------|---------------|--------|
-| `tiny` | 200 | 1 MiB | 1, 2 | seconds |
-| `small` | 2 000 | 4 MiB | 1, 2, 4 | default iteration |
-| `quick` | 10 000 | 16 MiB | 1, 2, 4 | few minutes |
+| Scale | Files / nest | Content | Outers | Intent |
+|-------|--------------|---------|--------|--------|
+| `tiny` | 200 | 1 MiB | 1, 2 | seconds / CI-ish |
+| `small` | 2 000 | 4 MiB | 1, 2, 4 | iteration |
+| `quick` | 10 000 | 16 MiB | 1, 2, 4 | minutes |
 | `full` | 1 000 000 | 300 MiB | 1, 2, 4, 10 | hours |
 
 ```bash
-# Fast local loop
 ./target/release/bench_nested all --scale tiny --threads 1,2,4
-./target/release/bench_nested all --scale small
-
-# Production-shaped (slow)
 ./target/release/bench_nested generate --scale full
 ./target/release/bench_nested run --scale full --threads 1,2,4 --level 1
 
-# Stored manual 7z baselines (same -mmt=N as --threads N; one nest at a time)
+# Manual 7z baselines at matching -mmt=N (one nest at a time), then side-by-side
 ./target/release/bench_nested baseline-manual --scale tiny --threads 1,2,4
-./target/release/bench_nested run --scale tiny --threads 1,2,4   # side-by-side tool vs manual
+./target/release/bench_nested run --scale tiny --threads 1,2,4
 ```
 
-Local fixtures/artifacts: `benchdata/<scale>/` (**gitignored**). Only result *tables* are committed under `docs/bench/`.
+- Local fixtures/outputs: `benchdata/` (**gitignored**)  
+- Committed numbers only: `docs/bench/RESULTS.md`, `docs/bench/full-results.csv`  
+- Agents: update those docs when performance-relevant code changes — see [`AGENTS.md`](AGENTS.md)
 
-### Tool vs manual 7z (fair one-at-a-time)
+### Tool vs manual (tests)
 
 ```bash
-# Fast correctness + short timing (CI)
 cargo test --test compare_7z_cli -- --nocapture
-
-# Multi-minute load (both paths one nested at a time; ignored by default)
-cargo test --release --test compare_7z_cli large_tool_vs_manual \
-  -- --ignored --nocapture
-# Optional: LARGE_BENCH_FILES=280000 LARGE_BENCH_NESTED=3 LARGE_BENCH_MIN_SECS=120
+cargo test --release --test compare_7z_cli large_tool_vs_manual -- --ignored --nocapture
 ```
 
-### Performance features (defaults on where safe)
+---
 
-| Feature | Flag / default |
-|---------|----------------|
-| Solid outer single-pass extract | default; `--no-solid-single-pass` |
-| Passthrough already-non-solid nested | default; `--no-passthrough-nonsolid` |
-| Auto pack threads (tiny files → 1) | omit `--threads` |
-| Extract/convert overlap prefetch | default; `--no-pipeline-overlap` |
-| Size-aware nested parallel | default: up to `--threads` workers, `--nested-size-budget 500M` |
-| Single nest → pack threads=1 | always |
-| Outer append store / tar / dir | `--outer-format 7z\|tar\|dir` |
-| Cap nested workers | `--nested-concurrency N` (`0` = auto) |
-| Exclude via 7z `-x!` when regex maps | automatic for `\.ext$`, `^prefix/` |
-| Stage timings | `--profile` |
-| Native parallel codec (Phase 3) | `--backend native` + `--native-pipeline parallel` |
-| Native LZMA2 engine | `--native-codec liblzma` \| `pure-rust` |
-| Skip corrupt nested | always (log + continue) |
+## Tests & CI
 
-Details: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+cargo test
+cargo test --release --test phase3_bakeoff -- --nocapture
+```
+
+| CI | Trigger | What |
+|----|---------|------|
+| `.github/workflows/ci.yml` | push/PR to `main` | check, test, release build, CLI smoke, compare bench job |
+| `.github/workflows/release.yml` | tags `v*` | multi-target `archiveconverter` + `bench_nested` binaries |
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+---
+
+## Project layout
+
+```text
+src/
+  main.rs, cli.rs, lib.rs
+  pipeline/     # nested orchestration
+  convert/      # converters
+  archive/      # cli + native backends
+  codec/        # outer 7z/tar/dir, Phase 3 codecs, headers
+  filter/       # exclude + rename
+  util/         # threads, size parse, temp, cleanup
+  bin/bench_nested.rs
+tests/          # e2e, cli smoke, compare_7z_cli, phase bakeoffs
+docs/
+  PERFORMANCE.md
+  bench/RESULTS.md, full-results.csv, SNAPSHOT.md
+AGENTS.md       # instructions for coding agents
+.grok/skills/   # Grok project skills
+```
+
+---
+
+## Documentation map
+
+| Doc | Audience |
+|-----|----------|
+| **This README** | Users + contributors; feature surface |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Optimization inventory + knobs |
+| [`docs/bench/RESULTS.md`](docs/bench/RESULTS.md) | **Published** timings |
+| [`docs/bench/SNAPSHOT.md`](docs/bench/SNAPSHOT.md) | Bench index |
+| [`AGENTS.md`](AGENTS.md) | Agents: keep docs/results in sync every commit |
+| `.grok/skills/keep-docs-current/` | Auto skill for the same policy |
+
+---
 
 ## License
 
