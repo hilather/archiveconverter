@@ -131,6 +131,17 @@ archiveconverter convert outer.7z -o out.7z --nested-concurrency 1   # force ser
 archiveconverter convert outer.7z -o out.7z --nested-size-budget 0   # workers only, no size cap
 ```
 
+## Outer archive append (store, no recompress)
+
+The outer non-solid archive is built by **appending** finished members (Copy method) under a
+**mutex** (`SyncedOuterWriter`):
+
+1. Nested convert finishes → stream that `.7z` into the outer pack section  
+2. Passthrough files are appended the same way  
+3. End header written once when all producers finish  
+
+Workers never share a bare file handle; only one thread appends at a time. Existing packs are
+not recompressed. Tests: `codec::store_writer` (roundtrip + concurrent append).
 ## Still open (future)
 
 - Map more regex exclude patterns to 7z globs.

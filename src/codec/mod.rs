@@ -5,10 +5,12 @@
 
 mod liblzma_codec;
 mod pure_rust;
+mod store_writer;
 mod writer;
 
 pub use liblzma_codec::LibLzmaCodec;
 pub use pure_rust::PureRustCodec;
+pub use store_writer::{NonsolidStoreWriter, SyncedOuterWriter};
 pub use writer::{write_nonsolid_lzma2, NonsolidLzma2Writer, PackedEntry};
 
 use crate::error::Result;

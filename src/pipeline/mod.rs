@@ -7,6 +7,7 @@ pub use context::PipelineOptions;
 pub use plan::{build_plan, ActionKind, ConversionPlan, PlanOptions};
 
 use crate::archive::{ArchiveBackend, PackOptions};
+use crate::codec::SyncedOuterWriter;
 use crate::convert::{ConvertContext, ConverterRegistry};
 use crate::error::{Error, Result};
 use crate::util::pathnorm::{is_safe_member_path, normalize_member_path};
@@ -15,7 +16,7 @@ use crate::util::temp::{remove_dir_all_quiet, JobTemp};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
 
@@ -52,8 +53,6 @@ pub fn run(backend: &dyn ArchiveBackend, opts: &PipelineOptions) -> Result<Conve
 fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &ConversionPlan) -> Result<()> {
     let start = Instant::now();
     let job = JobTemp::create(opts.temp_dir.as_deref(), opts.keep_temp)?;
-    let staging = job.child("outer-staging");
-    fs::create_dir_all(&staging)?;
 
     let max_workers = resolve_nested_workers(opts.nested_concurrency, opts.pack.threads);
     let size_budget = opts.nested_size_budget;
@@ -87,7 +86,22 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         log_stage(opts, "outer_bulk_extract", t.elapsed());
     }
 
-    // Passthrough files first (cheap).
+    // Streaming outer: append stored packs as members finish (mutex-serialized).
+    if let Some(parent) = opts.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let out_tmp = job.child("final-out.7z");
+    let outer = Arc::new(SyncedOuterWriter::create(&out_tmp)?);
+    tracing::info!(
+        path = %out_tmp.display(),
+        "outer archive: append-store writer (no final recompress pack)"
+    );
+
+    // Passthrough files first (cheap) — stream into outer under the same mutex.
+    let pass_tmp = job.child("passthrough-tmp");
+    fs::create_dir_all(&pass_tmp)?;
     for entry in &plan.entries {
         if entry.action != ActionKind::Passthrough {
             continue;
@@ -98,19 +112,26 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
                 entry.dest_path
             )));
         }
-        let dest = staging.join(&entry.dest_path);
+        // Unique temp name per member (flattened path)
+        let tmp = pass_tmp.join(entry.dest_path.replace('/', "__"));
         if use_solid_pass {
             let src = find_extracted(&outer_pass, &entry.source_path)?;
-            if let Some(parent) = dest.parent() {
+            if let Some(parent) = tmp.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&src, &dest)?;
+            fs::copy(&src, &tmp)?;
             let _ = fs::remove_file(&src);
         } else {
-            backend.extract_member(&opts.input, &entry.source_path, &dest)?;
+            if let Some(parent) = tmp.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            backend.extract_member(&opts.input, &entry.source_path, &tmp)?;
         }
-        tracing::info!(path = %entry.source_path, dest = %entry.dest_path, "passthrough outer member");
+        outer.push_path(entry.dest_path.clone(), &tmp)?;
+        let _ = fs::remove_file(&tmp);
+        tracing::info!(path = %entry.source_path, dest = %entry.dest_path, "passthrough outer member (appended)");
     }
+    remove_dir_all_quiet(&pass_tmp);
 
     let nested: Vec<_> = plan
         .entries
@@ -126,7 +147,7 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
             &registry,
             opts,
             job.path(),
-            &staging,
+            Arc::clone(&outer),
             use_solid_pass,
             &outer_pass,
             &nested,
@@ -148,34 +169,33 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         remove_dir_all_quiet(&outer_pass);
     }
 
-    // Nothing left to pack (all nested failed and no passthroughs).
-    let staged_files = count_staged_files(&staging);
-    if staged_files == 0 {
+    // Drop all Arc clones except ours so we can finish the writer.
+    let outer = Arc::try_unwrap(outer).map_err(|_| {
+        Error::Other("outer writer still shared; internal bug (producers not joined)".into())
+    })?;
+
+    if outer.is_empty()? {
         return Err(Error::Other(format!(
             "nothing to write: all {} nested archive(s) failed and there are no passthrough members",
             nested.len()
         )));
     }
 
-    if let Some(parent) = opts.output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let out_tmp = job.child("final-out.7z");
-    let mut pack = opts.pack.clone();
-    pack.non_solid = true;
-    // Outer usually has few members → multi-thread pack is fine if user didn't pin.
     let t = Instant::now();
-    backend.pack_dir(&staging, &out_tmp, &pack)?;
-    log_stage(opts, "pack_outer", t.elapsed());
+    let member_count = outer.len()?;
+    outer.finish()?;
+    log_stage(opts, "pack_outer_append_finish", t.elapsed());
+    tracing::info!(
+        members = member_count,
+        ms = t.elapsed().as_millis() as u64,
+        "outer archive header written"
+    );
 
     if opts.verify {
         tracing::info!("verifying output archive");
         backend.test(&out_tmp)?;
         let listed = backend.list(&out_tmp)?;
         let files = listed.iter().filter(|e| !e.is_dir).count();
-        // Expected = passthrough + successfully converted nested (skipped corrupt omitted).
         let expected = plan.passthrough_count() + nested_converted;
         if files != expected {
             return Err(Error::Other(format!(
@@ -197,14 +217,6 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         "conversion complete"
     );
     Ok(())
-}
-
-fn count_staged_files(staging: &Path) -> usize {
-    walkdir::WalkDir::new(staging)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .count()
 }
 
 /// Outcome of nested converts: successful members + soft-failed (corrupt/unreadable).
@@ -243,7 +255,7 @@ fn convert_nested_size_aware(
     registry: &ConverterRegistry,
     opts: &PipelineOptions,
     job_root: &Path,
-    staging: &Path,
+    outer: Arc<SyncedOuterWriter>,
     use_solid_pass: bool,
     outer_pass: &Path,
     nested: &[&plan::PlannedEntry],
@@ -307,14 +319,14 @@ fn convert_nested_size_aware(
     );
 
     let mut stats = if max_workers == 1 {
-        convert_nested_serial_ordered(backend, registry, opts, job_root, staging, jobs)?
+        convert_nested_serial_ordered(backend, registry, opts, job_root, outer, jobs)?
     } else {
         convert_nested_parallel_budget(
             backend,
             registry,
             opts,
             job_root,
-            staging,
+            outer,
             jobs,
             max_workers,
             size_budget,
@@ -337,7 +349,7 @@ fn convert_nested_serial_ordered(
     registry: &ConverterRegistry,
     opts: &PipelineOptions,
     job_root: &Path,
-    staging: &Path,
+    outer: Arc<SyncedOuterWriter>,
     jobs: Vec<NestedJob>,
 ) -> Result<NestedRunStats> {
     let mut converted = 0usize;
@@ -358,7 +370,7 @@ fn convert_nested_serial_ordered(
             job.index,
             &job.path,
             &job.dest_path,
-            staging,
+            &outer,
         ) {
             Ok(()) => converted += 1,
             Err(e) => {
@@ -379,7 +391,7 @@ fn convert_nested_parallel_budget(
     registry: &ConverterRegistry,
     opts: &PipelineOptions,
     job_root: &Path,
-    staging: &Path,
+    outer: Arc<SyncedOuterWriter>,
     jobs: Vec<NestedJob>,
     max_workers: usize,
     size_budget: u64,
@@ -388,7 +400,6 @@ fn convert_nested_parallel_budget(
     let mut pending: VecDeque<NestedJob> = jobs.into();
     let opts = opts.clone();
     let job_root = job_root.to_path_buf();
-    let staging = staging.to_path_buf();
 
     let (done_tx, done_rx) = mpsc::channel::<(u64, String, std::result::Result<(), String>)>();
     let mut running_count = 0usize;
@@ -445,7 +456,7 @@ fn convert_nested_parallel_budget(
                 let done_tx = done_tx.clone();
                 let opts = &opts;
                 let job_root = &job_root;
-                let staging = &staging;
+                let outer = Arc::clone(&outer);
                 let registry = registry;
                 let backend = backend;
                 let size = job.size;
@@ -459,7 +470,7 @@ fn convert_nested_parallel_budget(
                         job.index,
                         &job.path,
                         &job.dest_path,
-                        staging,
+                        &outer,
                     )
                     .map_err(|e| e.to_string());
                     let _ = fs::remove_file(&job.path);
@@ -604,7 +615,7 @@ fn convert_one_nested_from_file(
     index: usize,
     inner_in: &Path,
     dest_member: &str,
-    staging: &Path,
+    outer: &SyncedOuterWriter,
 ) -> Result<()> {
     let nested_root = job_root.join(format!("nested-{index:04}"));
     if nested_root.exists() {
@@ -638,11 +649,8 @@ fn convert_one_nested_from_file(
                 "unsafe destination path: {dest_member}"
             )));
         }
-        let dest = staging.join(dest_member);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        persist_file(&output.path, &dest)?;
+        // Serialize append into the shared outer (other workers may finish in parallel).
+        outer.push_path(dest_member.to_string(), &output.path)?;
         Ok(())
     })();
 
