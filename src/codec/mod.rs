@@ -5,6 +5,7 @@
 
 mod liblzma_codec;
 mod pure_rust;
+mod sevenz_header;
 mod store_writer;
 mod writer;
 
