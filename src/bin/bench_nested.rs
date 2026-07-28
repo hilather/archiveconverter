@@ -1379,7 +1379,7 @@ fn write_markdown(
     writeln!(f)?;
     writeln!(
         f,
-        "- These runs pin pack threads via `--threads N` (tool) / `-mmt=N` (manual baseline)."
+        "- These runs pin pack / nest concurrency via `--threads N` (tool) / `-mmt=N` (manual baseline)."
     )?;
     writeln!(
         f,
@@ -1392,6 +1392,10 @@ fn write_markdown(
     writeln!(
         f,
         "- `ratio tool/manual` uses the **same thread count** on both sides when a baseline cell exists."
+    )?;
+    writeln!(
+        f,
+        "- Published project tables: `docs/bench/RESULTS.md`."
     )?;
     Ok(())
 }
