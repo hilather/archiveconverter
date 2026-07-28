@@ -7,7 +7,7 @@ pub use context::PipelineOptions;
 pub use plan::{build_plan, ActionKind, ConversionPlan, PlanOptions};
 
 use crate::archive::{ArchiveBackend, PackOptions};
-use crate::codec::SyncedOuterWriter;
+use crate::codec::{count_dir_files, count_tar_files, OuterFormat, SyncedOuterWriter};
 use crate::convert::{ConvertContext, ConverterRegistry};
 use crate::error::{Error, Result};
 use crate::util::pathnorm::{is_safe_member_path, normalize_member_path};
@@ -54,7 +54,14 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
     let start = Instant::now();
     let job = JobTemp::create(opts.temp_dir.as_deref(), opts.keep_temp)?;
 
-    let max_workers = resolve_nested_workers(opts.nested_concurrency, opts.pack.threads);
+    let nest_n = plan.nested_count();
+    // One nest: never parallelize across nests, and force pack/encode threads=1.
+    // Full benches show multi-thread LZMA often *slower* on dense tiny-file nests.
+    let max_workers = if nest_n <= 1 {
+        1
+    } else {
+        resolve_nested_workers(opts.nested_concurrency, opts.pack.threads)
+    };
     let size_budget = opts.nested_size_budget;
     let registry = ConverterRegistry::with_builtins();
 
@@ -86,17 +93,23 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         log_stage(opts, "outer_bulk_extract", t.elapsed());
     }
 
-    // Streaming outer: append stored packs as members finish (mutex-serialized).
+    // Streaming outer: append finished members as they complete (mutex-serialized).
     if let Some(parent) = opts.output.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let out_tmp = job.child("final-out.7z");
-    let outer = Arc::new(SyncedOuterWriter::create(&out_tmp)?);
+    let outer_format = opts.outer_format;
+    let out_tmp = if outer_format.is_directory() {
+        job.child("final-out-dir")
+    } else {
+        job.child(&format!("final-out.{}", outer_format.extension()))
+    };
+    let outer = Arc::new(SyncedOuterWriter::create(&out_tmp, outer_format)?);
     tracing::info!(
         path = %out_tmp.display(),
-        "outer archive: append-store writer (no final recompress pack)"
+        format = outer_format.as_str(),
+        "outer: append writer (7z/tar store, or directory — no recompress wrap)"
     );
 
     // Passthrough files first (cheap) — stream into outer under the same mutex.
@@ -142,10 +155,20 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
     let mut nested_converted = 0usize;
     let mut nested_skipped = 0usize;
     if !nested.is_empty() {
+        // For a single nested archive, pin compress threads to 1 even if --threads N.
+        let mut nested_opts = opts.clone();
+        if nested.len() <= 1 {
+            if opts.pack.threads.map(|t| t != 1).unwrap_or(true) {
+                tracing::info!(
+                    "single nested archive: forcing --threads 1 for nest convert (MT often slower)"
+                );
+            }
+            nested_opts.pack.threads = Some(1);
+        }
         let stats = convert_nested_size_aware(
             backend,
             &registry,
-            opts,
+            &nested_opts,
             job.path(),
             Arc::clone(&outer),
             use_solid_pass,
@@ -187,16 +210,23 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
     log_stage(opts, "pack_outer_append_finish", t.elapsed());
     tracing::info!(
         members = member_count,
+        format = outer_format.as_str(),
         ms = t.elapsed().as_millis() as u64,
-        "outer archive header written"
+        "outer finalize complete"
     );
 
     if opts.verify {
-        tracing::info!("verifying output archive");
-        backend.test(&out_tmp)?;
-        let listed = backend.list(&out_tmp)?;
-        let files = listed.iter().filter(|e| !e.is_dir).count();
+        tracing::info!(format = outer_format.as_str(), "verifying output");
         let expected = plan.passthrough_count() + nested_converted;
+        let files = match outer_format {
+            OuterFormat::SevenZ => {
+                backend.test(&out_tmp)?;
+                let listed = backend.list(&out_tmp)?;
+                listed.iter().filter(|e| !e.is_dir).count()
+            }
+            OuterFormat::Tar => count_tar_files(&out_tmp)?,
+            OuterFormat::Dir => count_dir_files(&out_tmp)?,
+        };
         if files != expected {
             return Err(Error::Other(format!(
                 "verify failed: expected {expected} files in output (passthrough + converted nested; {nested_skipped} skipped), found {files}"
@@ -204,10 +234,15 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         }
     }
 
-    persist_file(&out_tmp, &opts.output)?;
+    if outer_format.is_directory() {
+        persist_dir(&out_tmp, &opts.output)?;
+    } else {
+        persist_file(&out_tmp, &opts.output)?;
+    }
 
     tracing::info!(
         output = %opts.output.display(),
+        outer_format = outer_format.as_str(),
         elapsed_ms = start.elapsed().as_millis() as u64,
         solid_single_pass = use_solid_pass,
         nested_workers = max_workers,
@@ -605,6 +640,56 @@ fn persist_file(src: &Path, dest: &Path) -> Result<()> {
         }
         Err(e) => Err(Error::Io(e)),
     }
+}
+
+/// Move a finished outer directory into place (replace existing dest).
+fn persist_dir(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    if dest.exists() {
+        if dest.is_dir() {
+            fs::remove_dir_all(dest).map_err(|e| {
+                Error::Other(format!("remove existing output dir {}: {e}", dest.display()))
+            })?;
+        } else {
+            fs::remove_file(dest)?;
+        }
+    }
+    match fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_dir_recursive(src, dest)?;
+            remove_dir_all_quiet(src);
+            Ok(())
+        }
+        Err(e) => Err(Error::Other(format!(
+            "move outer dir {} → {}: {e}",
+            src.display(),
+            dest.display()
+        ))),
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+        let rel = entry.path().strip_prefix(src).map_err(|e| {
+            Error::Other(format!("strip prefix: {e}"))
+        })?;
+        let target = dest.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn convert_one_nested_from_file(

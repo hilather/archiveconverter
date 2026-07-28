@@ -85,13 +85,25 @@ archiveconverter convert outer.7z -o out.7z \
   --rename '_old\.7z$=.7z' \
   --dry-run
 
-# Convert (nested one-at-a-time)
+# Convert (nested one-at-a-time) → non-solid outer 7z (default)
 archiveconverter convert outer.7z -o out.7z \
   --exclude-outer '^skip_me\.7z$' \
   --exclude-inner '(?i)\.tmp$' \
   --rename '_old\.7z$=.7z' \
   --verify \
   --level 5
+
+# Same conversion, outer container as uncompressed tar
+# (nested members stay as non-solid .7z files inside the tar)
+archiveconverter convert outer.7z -o out.tar --outer-format tar --verify --level 1
+# or infer format from the extension:
+archiveconverter convert outer.7z -o out.tar --verify --level 1
+
+# First layer only: convert nested solid→non-solid and write members into a directory
+# (no re-wrap in 7z/tar). Default dir name matches the archive stem next to the input:
+#   path/game.7z  →  path/game/
+archiveconverter convert path/game.7z --outer-format dir --verify --level 1
+archiveconverter convert outer.7z -o /tmp/unpacked --outer-format dir --level 1
 
 # Single archive only (no nesting)
 archiveconverter convert-single solid.7z -o nonsolid.7z --exclude '\.tmp$' --verify
@@ -101,14 +113,16 @@ archiveconverter convert-single solid.7z -o nonsolid.7z --exclude '\.tmp$' --ver
 
 | Flag | Meaning |
 |------|---------|
+| `--outer-format 7z\|tar\|dir` | Outer container (`7z` default; `tar` = uncompressed; `dir` = first-layer files only). If omitted: `.tar` → tar; path ending in `/` → dir |
+| `-o PATH` | Output file (7z/tar) or directory (`dir`). For `dir`, defaults to `<input-dir>/<archive-stem>/` |
 | `--exclude-inner REGEX` | Drop matching paths **inside** each nested 7z |
 | `--exclude-outer REGEX` | Drop matching members of the **outer** archive |
 | `--rename PATTERN=REPL` | Rewrite outer member names (ordered; supports `$1` / `$name`) |
 | `--basename-match` | Match excludes against basename only |
 | `--dry-run` | Print plan only |
-| `--verify` | `7z t` + entry count check |
+| `--verify` | Entry-count check (`7z t` for outer 7z; tar member count for tar) |
 | `--temp-dir` / `--keep-temp` | Control temp workspace |
-| `--level` / `--threads` | Compression knobs passed to 7z |
+| `--level` / `--threads` | Compression knobs passed to 7z (nested members; outer store/tar is uncompressed) |
 
 Path matching uses normalized `/` separators (Rust `regex` crate).
 
@@ -156,14 +170,25 @@ cargo build --release --bin archiveconverter --bin bench_nested
 # Production-shaped (slow)
 ./target/release/bench_nested generate --scale full
 ./target/release/bench_nested run --scale full --threads 1,2,3,4
+
+# Stored manual 7z baselines (same -mmt=N as --threads N; one nest at a time)
+./target/release/bench_nested baseline-manual --scale tiny --threads 1,2,4
+./target/release/bench_nested run --scale tiny --threads 1,2,4   # side-by-side tool vs manual
+# full: baseline once, then re-run tool freely without re-timing manual
+./target/release/bench_nested baseline-manual --scale full --threads 1,2,4 --level 1
+./target/release/bench_nested run --scale full --threads 1,2,4 --level 1
+# or: all --scale small --refresh-manual-baseline
 ```
 
-Fixtures and results: `benchdata/<scale>/` (gitignored). Full-run notes:
+Fixtures and results: `benchdata/<scale>/` (gitignored). Manual baselines:
+`benchdata/<scale>/results/manual_baseline.json`. Full-run notes:
 `benchdata/full/results/RESULTS.md`.
 
 **Finding on million-tiny-file workloads:** `--threads 1` is often *faster* than
 2–4; multi-threaded LZMA does not help when per-file work is tiny and nested
-archives convert serially.
+archives convert serially. Side-by-side uses the **same thread count** on both
+sides (`--threads N` ↔ manual `-mmt=N`). Manual is always one-nest-at-a-time;
+the tool may convert multiple nests concurrently under the size budget.
 
 ### Tool vs manual 7z (fair one-at-a-time)
 

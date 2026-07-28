@@ -88,6 +88,100 @@ fn dry_run_does_not_write_output() {
 }
 
 #[test]
+fn nested_convert_outer_as_directory() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    // Default naming: stem of outer path next to it
+    let expected_dir = archiveconverter::codec::default_dir_from_input(&outer);
+    assert_eq!(
+        expected_dir,
+        root.path().join(
+            outer
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )
+    );
+
+    let mut opts = PipelineOptions::new(outer, expected_dir.clone());
+    opts.outer_format = archiveconverter::codec::OuterFormat::Dir;
+    opts.exclude_outer = MemberFilter::with_excludes([r"^skip_me\.7z$"]).unwrap();
+    opts.exclude_inner = MemberFilter::with_excludes([r"(?i)\.tmp$", r"^__MACOSX/"]).unwrap();
+    opts.rename = NameTransformer::from_pairs([r"_old\.7z$=.7z"]).unwrap();
+    opts.verify = true;
+    opts.pack = default_pack();
+    opts.temp_dir = Some(root.path().join("tmp"));
+
+    let plan = pipeline::run(&backend(), &opts).expect("convert to dir");
+    assert_eq!(plan.nested_count(), 2);
+    assert_eq!(plan.passthrough_count(), 1);
+    assert!(expected_dir.is_dir());
+    assert!(expected_dir.join("alpha.7z").is_file());
+    assert!(expected_dir.join("beta.7z").is_file());
+    assert!(expected_dir.join("readme.txt").is_file());
+    assert!(!expected_dir.join("skip_me.7z").exists());
+    assert_eq!(
+        archiveconverter::codec::count_dir_files(&expected_dir).unwrap(),
+        3
+    );
+    assert_archive_ok(&expected_dir.join("alpha.7z"));
+}
+
+#[test]
+fn nested_convert_outer_as_uncompressed_tar() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    let out = root.path().join("converted.tar");
+
+    let mut opts = PipelineOptions::new(outer, out.clone());
+    opts.outer_format = archiveconverter::codec::OuterFormat::Tar;
+    opts.exclude_outer = MemberFilter::with_excludes([r"^skip_me\.7z$"]).unwrap();
+    opts.exclude_inner = MemberFilter::with_excludes([r"(?i)\.tmp$", r"^__MACOSX/"]).unwrap();
+    opts.rename = NameTransformer::from_pairs([r"_old\.7z$=.7z"]).unwrap();
+    opts.verify = true;
+    opts.pack = default_pack();
+    opts.temp_dir = Some(root.path().join("tmp"));
+
+    let plan = pipeline::run(&backend(), &opts).expect("convert to tar");
+    assert_eq!(plan.nested_count(), 2);
+    assert_eq!(plan.passthrough_count(), 1);
+    assert!(out.is_file(), "tar output missing");
+
+    // Uncompressed tar of nested .7z + readme
+    assert_eq!(
+        archiveconverter::codec::count_tar_files(&out).unwrap(),
+        3,
+        "alpha.7z + beta.7z + readme.txt"
+    );
+
+    // Extract tar members with system tar and check nested 7z is listable.
+    let extract = root.path().join("tar-out");
+    fs::create_dir_all(&extract).unwrap();
+    let status = std::process::Command::new("tar")
+        .args(["-xf", out.to_str().unwrap(), "-C", extract.to_str().unwrap()])
+        .status()
+        .expect("spawn tar");
+    assert!(status.success(), "system tar extract failed");
+    assert!(extract.join("alpha.7z").is_file() || extract.join("alpha.7z").exists());
+    // rename alpha_old → alpha
+    let alpha = if extract.join("alpha.7z").is_file() {
+        extract.join("alpha.7z")
+    } else {
+        // walk
+        walkdir::WalkDir::new(&extract)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name() == "alpha.7z")
+            .map(|e| e.path().to_path_buf())
+            .expect("alpha.7z in tar")
+    };
+    assert_archive_ok(&alpha);
+}
+
+#[test]
 fn rename_collision_fails_plan() {
     ensure_7z();
     let root = tempfile::tempdir().unwrap();

@@ -61,8 +61,9 @@ fn try_main() -> Result<()> {
             let plan = pipeline::run(backend.as_ref(), &opts)?;
             if !opts.dry_run {
                 println!(
-                    "Wrote {} (nested={}, passthrough={}, skipped={}, backend={})",
+                    "Wrote {} (outer={}, nested={}, passthrough={}, skipped={}, backend={})",
                     opts.output.display(),
+                    opts.outer_format.as_str(),
                     plan.nested_count(),
                     plan.passthrough_count(),
                     plan.skip_count(),

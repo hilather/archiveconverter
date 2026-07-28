@@ -2,12 +2,35 @@
 
 use crate::archive::native::{NativeOptions, NativePipeline, DEFAULT_LARGE_FILE_THRESHOLD};
 use crate::archive::{BackendKind, PackOptions};
-use crate::codec::CodecKind;
+use crate::codec::{CodecKind, OuterFormat};
 use crate::error::{Error, Result};
 use crate::filter::{MemberFilter, NameTransformer};
 use crate::pipeline::PipelineOptions;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// Outer container for converted nested archives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliOuterFormat {
+    /// Non-solid 7z (Copy/store method). Default when output is not `.tar` / dir.
+    #[value(name = "7z", alias = "sevenz")]
+    SevenZ,
+    /// Uncompressed tar (nested members stay as compressed `.7z` files inside).
+    Tar,
+    /// No re-wrap: write first-layer members into a directory.
+    #[value(name = "dir", alias = "directory", alias = "folder")]
+    Dir,
+}
+
+impl From<CliOuterFormat> for OuterFormat {
+    fn from(v: CliOuterFormat) -> Self {
+        match v {
+            CliOuterFormat::SevenZ => OuterFormat::SevenZ,
+            CliOuterFormat::Tar => OuterFormat::Tar,
+            CliOuterFormat::Dir => OuterFormat::Dir,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliBackend {
@@ -58,9 +81,17 @@ pub struct ConvertArgs {
     /// Input outer .7z archive
     pub input: PathBuf,
 
-    /// Output .7z path
+    /// Output path (file for 7z/tar, directory for `--outer-format dir`).
+    /// For dir mode, defaults to `<input-dir>/<archive-stem>/` (matches the archive name).
+    /// Required for 7z/tar unless you only dry-run.
     #[arg(short = 'o', long)]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
+
+    /// Outer container: `7z` (default), `tar` (uncompressed), or `dir` (no re-wrap).
+    /// If omitted: `.tar` path → tar; path ending in `/` → dir; else 7z.
+    /// With `dir` and no `-o`, the directory is named after the input archive.
+    #[arg(long = "outer-format", value_enum)]
+    pub outer_format: Option<CliOuterFormat>,
 
     /// Regex to exclude members inside nested archives (repeatable)
     #[arg(long = "exclude-inner")]
@@ -227,6 +258,33 @@ fn parse_pipeline(s: &str) -> Result<NativePipeline> {
 }
 
 impl ConvertArgs {
+    /// Resolve outer format + output path (dir defaults to input archive stem).
+    pub fn resolve_output(&self) -> Result<(OuterFormat, std::path::PathBuf)> {
+        let format = OuterFormat::resolve(
+            self.outer_format.map(Into::into),
+            self.output.as_deref(),
+        );
+        let output = match &self.output {
+            Some(p) => p.clone(),
+            None if format.is_directory() => {
+                crate::codec::default_dir_from_input(&self.input)
+            }
+            None if self.dry_run => {
+                // Dry-run never writes; placeholder path is fine.
+                std::path::PathBuf::from("out.7z")
+            }
+            None => {
+                return Err(Error::Other(
+                    "-o/--output is required for outer formats 7z and tar \
+                     (for directory output use --outer-format dir; default dir name \
+                     matches the input archive stem)"
+                        .into(),
+                ));
+            }
+        };
+        Ok((format, output))
+    }
+
     pub fn to_pipeline_options(&self) -> Result<PipelineOptions> {
         let mut exclude_inner = MemberFilter::with_excludes(&self.exclude_inner)?;
         let mut exclude_outer = MemberFilter::with_excludes(&self.exclude_outer)?;
@@ -238,7 +296,8 @@ impl ConvertArgs {
         if self.level > 9 {
             return Err(Error::Other("--level must be 0-9".into()));
         }
-        let mut opts = PipelineOptions::new(self.input.clone(), self.output.clone());
+        let (outer_format, output) = self.resolve_output()?;
+        let mut opts = PipelineOptions::new(self.input.clone(), output);
         opts.exclude_inner = exclude_inner;
         opts.exclude_outer = exclude_outer;
         opts.rename = rename;
@@ -254,6 +313,7 @@ impl ConvertArgs {
         opts.profile = self.profile;
         // Native backend: prefer streaming solid→non-solid (no full tree).
         opts.prefer_streaming = matches!(self.backend, CliBackend::Native);
+        opts.outer_format = outer_format;
         opts.pack = PackOptions {
             non_solid: true,
             threads: self.threads, // None → auto policy inside converter

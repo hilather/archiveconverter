@@ -3,15 +3,19 @@
 //! Codecs produce **raw LZMA2** streams (method id `0x21`) suitable for embedding
 //! in non-solid 7z pack streams, plus the 1-byte 7z LZMA2 properties byte.
 
+mod dir_writer;
 mod liblzma_codec;
 mod pure_rust;
 mod sevenz_header;
 mod store_writer;
+mod tar_writer;
 mod writer;
 
+pub use dir_writer::{count_dir_files, default_dir_from_input, DirOuterWriter};
 pub use liblzma_codec::LibLzmaCodec;
 pub use pure_rust::PureRustCodec;
-pub use store_writer::{NonsolidStoreWriter, SyncedOuterWriter};
+pub use store_writer::{NonsolidStoreWriter, OuterFormat, SyncedOuterWriter};
+pub use tar_writer::{count_tar_files, TarOuterWriter};
 pub use writer::{write_nonsolid_lzma2, NonsolidLzma2Writer, PackedEntry};
 
 use crate::error::Result;

@@ -1,6 +1,7 @@
 //! Runtime options for the conversion pipeline.
 
 use crate::archive::PackOptions;
+use crate::codec::OuterFormat;
 use crate::filter::{MemberFilter, NameTransformer};
 use crate::util::DEFAULT_NESTED_SIZE_BUDGET;
 use std::path::PathBuf;
@@ -33,10 +34,13 @@ pub struct PipelineOptions {
     pub profile: bool,
     /// Prefer native streaming convert (no full extract tree) when backend supports it.
     pub prefer_streaming: bool,
+    /// Outer container: non-solid 7z (default) or uncompressed tar.
+    pub outer_format: OuterFormat,
 }
 
 impl PipelineOptions {
     pub fn new(input: PathBuf, output: PathBuf) -> Self {
+        let outer_format = OuterFormat::from_output_path(&output);
         Self {
             input,
             output,
@@ -55,6 +59,7 @@ impl PipelineOptions {
             pipeline_overlap: true,
             profile: false,
             prefer_streaming: false,
+            outer_format,
         }
     }
 }

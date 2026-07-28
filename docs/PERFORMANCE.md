@@ -123,6 +123,8 @@ Default when converting an outer with nested 7z members:
 
 Schedule: sort nests **smallest first**; start the next only if workers free **and** `running_sum + size ≤ budget`. A single nest larger than the budget still runs alone.
 
+**Single nested archive:** always convert with **1 pack/encode thread** (and 1 nest worker), even if `--threads N` is set. Full-scale benches showed multi-thread LZMA often slower on dense tiny-file nests; multi-thread still applies when there are **2+** nests (and to size-aware nest concurrency).
+
 Example: budget `500M`, 5 threads, five ~100 MB nests → all five concurrent.
 
 ```bash

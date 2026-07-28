@@ -85,11 +85,81 @@ fn convert_full_cli() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Wrote"));
+        .stdout(predicate::str::contains("Wrote"))
+        .stdout(predicate::str::contains("outer=7z"));
 
     assert!(out.is_file());
     assert!(fs::metadata(&out).unwrap().len() > 0);
     assert_archive_ok(&out);
+}
+
+#[test]
+fn convert_outer_tar_cli() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    let out = root.path().join("out.tar");
+
+    bin()
+        .args([
+            "convert",
+            outer.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--outer-format",
+            "tar",
+            "--exclude-outer",
+            r"^skip_me\.7z$",
+            "--rename",
+            r"_old\.7z$=.7z",
+            "--verify",
+            "--level",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote"))
+        .stdout(predicate::str::contains("outer=tar"));
+
+    assert!(out.is_file());
+    assert!(fs::metadata(&out).unwrap().len() > 0);
+    assert_eq!(
+        archiveconverter::codec::count_tar_files(&out).unwrap(),
+        3 // alpha.7z, beta.7z, readme
+    );
+}
+
+#[test]
+fn convert_outer_dir_default_name_cli() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    // No -o: default dir = stem of outer next to it
+    let expected = archiveconverter::codec::default_dir_from_input(&outer);
+
+    bin()
+        .args([
+            "convert",
+            outer.to_str().unwrap(),
+            "--outer-format",
+            "dir",
+            "--exclude-outer",
+            r"^skip_me\.7z$",
+            "--rename",
+            r"_old\.7z$=.7z",
+            "--verify",
+            "--level",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote"))
+        .stdout(predicate::str::contains("outer=dir"));
+
+    assert!(expected.is_dir(), "expected default dir {}", expected.display());
+    assert!(expected.join("alpha.7z").is_file());
+    assert!(expected.join("beta.7z").is_file());
+    assert!(expected.join("readme.txt").is_file());
 }
 
 #[test]
