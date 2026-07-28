@@ -1261,10 +1261,12 @@ fn print_report(rows: &[BenchRow], manual: Option<&ManualBaselineFile>, level: u
         println!("- Tool may convert multiple nests concurrently (size budget); manual is always serial.");
         println!("- Single nest: tool forces pack threads=1 even if --threads N (MT often slower).");
     } else {
-        println!("- Nested concurrency is size-aware; --threads also sets pack -mmt / nest workers.");
+        println!("- Size-aware nested concurrency: --threads sets nest workers + pack -mmt (when nests≥2).");
+        println!("- Single nest: pack threads forced to 1; multi-nest can convert in parallel under budget.");
     }
-    println!("- Solid decompress is largely sequential; gains come from non-solid recompress.");
-    println!("- Many tiny files reduce MT efficiency vs few large files.");
+    println!("- Solid decompress is largely sequential; gains come from non-solid recompress + nest concurrency.");
+    println!("- Many tiny files reduce MT pack efficiency; multi-nest workers still help overall wall time.");
+    println!("- Published tables: docs/bench/RESULTS.md");
 }
 
 fn write_csv(
