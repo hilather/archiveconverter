@@ -113,6 +113,7 @@ mod tests {
             size: 1,
             is_dir: false,
             format_hint: ArchiveFormat::SevenZ,
+            meta: Default::default(),
         };
         assert_eq!(
             r.find_for(&entry).unwrap().id(),

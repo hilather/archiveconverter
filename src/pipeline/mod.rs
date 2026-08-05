@@ -6,19 +6,49 @@ pub mod plan;
 pub use context::PipelineOptions;
 pub use plan::{build_plan, ActionKind, ConversionPlan, PlanOptions};
 
-use crate::archive::{ArchiveBackend, PackOptions};
-use crate::codec::{count_dir_files, count_tar_files, OuterFormat, SyncedOuterWriter};
+use crate::archive::native::NativeSevenZ;
+use crate::archive::{ArchiveBackend, EntryMeta, PackOptions};
+use crate::codec::{
+    count_dir_files, count_tar_files, FileMeta, OuterFormat, SyncedOuterWriter,
+};
 use crate::convert::{ConvertContext, ConverterRegistry};
 use crate::error::{Error, Result};
 use crate::util::pathnorm::{is_safe_member_path, normalize_member_path};
 use crate::util::size_parse::{can_admit_nested, resolve_nested_workers};
 use crate::util::temp::{remove_dir_all_quiet, JobTemp};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
+
+/// Fill missing per-member times/attrs from a native 7z header parse.
+///
+/// CLI `list`/`extract -so` often lack FILETIME; the pure-Rust reader still
+/// surfaces exact header metadata for outer store preservation.
+fn enrich_entry_meta(archive: &Path, entries: &mut [EntryMeta]) {
+    let native = NativeSevenZ::new();
+    let Ok(listed) = native.list(archive) else {
+        return;
+    };
+    let by_path: HashMap<String, FileMeta> = listed
+        .into_iter()
+        .map(|e| (normalize_member_path(&e.path), e.meta))
+        .collect();
+    for e in entries.iter_mut() {
+        let key = normalize_member_path(&e.path);
+        if let Some(m) = by_path.get(&key) {
+            // Prefer exact header fields from the native parse over incomplete
+            // CLI listings (e.g. BA attr "A" → 0x20 without Unix mode bits).
+            e.meta.mtime = m.mtime.or(e.meta.mtime);
+            e.meta.ctime = m.ctime.or(e.meta.ctime);
+            e.meta.atime = m.atime.or(e.meta.atime);
+            e.meta.windows_attributes =
+                m.windows_attributes.or(e.meta.windows_attributes);
+        }
+    }
+}
 
 /// Run conversion (or dry-run). Returns the plan that was executed/printed.
 pub fn run(backend: &dyn ArchiveBackend, opts: &PipelineOptions) -> Result<ConversionPlan> {
@@ -29,7 +59,8 @@ pub fn run(backend: &dyn ArchiveBackend, opts: &PipelineOptions) -> Result<Conve
         )));
     }
 
-    let entries = backend.list(&opts.input)?;
+    let mut entries = backend.list(&opts.input)?;
+    enrich_entry_meta(&opts.input, &mut entries);
     let plan = build_plan(
         opts.input.clone(),
         opts.output.clone(),
@@ -140,7 +171,10 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
             }
             backend.extract_member(&opts.input, &entry.source_path, &tmp)?;
         }
-        outer.push_path(entry.dest_path.clone(), &tmp)?;
+        // Prefer source outer listing meta; fill gaps from extracted FS times (CLI extract).
+        let mut meta = entry.meta.clone();
+        meta.merge_missing(&FileMeta::from_fs_path(&tmp));
+        outer.push_path_with_meta(entry.dest_path.clone(), &tmp, Some(meta))?;
         let _ = fs::remove_file(&tmp);
         tracing::info!(path = %entry.source_path, dest = %entry.dest_path, "passthrough outer member (appended)");
     }
@@ -325,12 +359,16 @@ fn convert_nested_size_aware(
         } else {
             fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
         };
+        // Capture outer-member meta before convert rewrites the nest file on disk.
+        let mut meta = entry.meta.clone();
+        meta.merge_missing(&FileMeta::from_fs_path(&path));
         jobs.push(NestedJob {
             index,
             source_path: entry.source_path.clone(),
             dest_path: entry.dest_path.clone(),
             size,
             path,
+            meta,
         });
     }
     jobs.sort_by(|a, b| a.size.cmp(&b.size).then_with(|| a.index.cmp(&b.index)));
@@ -377,6 +415,8 @@ struct NestedJob {
     dest_path: String,
     size: u64,
     path: PathBuf,
+    /// Outer-archive member metadata for the nested `.7z` (not inner file meta).
+    meta: FileMeta,
 }
 
 fn convert_nested_serial_ordered(
@@ -406,6 +446,7 @@ fn convert_nested_serial_ordered(
             &job.path,
             &job.dest_path,
             &outer,
+            &job.meta,
         ) {
             Ok(()) => converted += 1,
             Err(e) => {
@@ -506,6 +547,7 @@ fn convert_nested_parallel_budget(
                         &job.path,
                         &job.dest_path,
                         &outer,
+                        &job.meta,
                     )
                     .map_err(|e| e.to_string());
                     let _ = fs::remove_file(&job.path);
@@ -701,6 +743,7 @@ fn convert_one_nested_from_file(
     inner_in: &Path,
     dest_member: &str,
     outer: &SyncedOuterWriter,
+    outer_member_meta: &FileMeta,
 ) -> Result<()> {
     let nested_root = job_root.join(format!("nested-{index:04}"));
     if nested_root.exists() {
@@ -734,8 +777,12 @@ fn convert_one_nested_from_file(
                 "unsafe destination path: {dest_member}"
             )));
         }
-        // Serialize append into the shared outer (other workers may finish in parallel).
-        outer.push_path(dest_member.to_string(), &output.path)?;
+        // Preserve the outer member's source times/attrs (not the convert-temp file times).
+        outer.push_path_with_meta(
+            dest_member.to_string(),
+            &output.path,
+            Some(outer_member_meta.clone()),
+        )?;
         Ok(())
     })();
 

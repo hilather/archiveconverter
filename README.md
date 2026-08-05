@@ -46,6 +46,7 @@ Nested *content* is still compressed 7z; only the **outer container** and **soli
 | **Backends** | `cli` (default) or `native` (streaming Phase 1–3 pipelines) |
 | **Native Phase 3** | Windowed parallel LZMA2 (`liblzma` or pure-rust); packs stream out; bounded RAM |
 | **Headers** | Custom non-solid writers aligned for 7zz / sevenz-rust2 / common mounters |
+| **File metadata** | Member **Modified** times and Windows attributes preserved through solid→non-solid and outer 7z store append (native + CLI) |
 | **Bench harness** | `bench_nested` scales + **stored manual 7z baselines** at matching `-mmt=N` |
 
 ---

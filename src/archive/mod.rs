@@ -4,8 +4,11 @@ pub mod detect;
 pub mod native;
 pub mod sevenz;
 
+use crate::codec::FileMeta;
 use crate::error::Result;
 use std::path::{Path, PathBuf};
+
+pub use crate::codec::FileMeta as EntryFileMeta;
 
 /// Which implementation drives 7z operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,6 +78,8 @@ pub struct EntryMeta {
     pub size: u64,
     pub is_dir: bool,
     pub format_hint: ArchiveFormat,
+    /// Times / Windows attributes from the archive header when known.
+    pub meta: FileMeta,
 }
 
 impl EntryMeta {

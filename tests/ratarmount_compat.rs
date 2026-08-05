@@ -163,6 +163,7 @@ fn ratarmount_rs_opens_lzma2_writer_archive() {
         entries.push(PackedEntry {
             name: format!("d{i}/f.txt"),
             compressed: c,
+            meta: Default::default(),
         });
     }
     write_nonsolid_lzma2(&out, &entries).unwrap();

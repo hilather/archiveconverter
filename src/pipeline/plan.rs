@@ -1,6 +1,7 @@
 //! Build a conversion plan for dry-run and execution.
 
 use crate::archive::{ArchiveFormat, EntryMeta};
+use crate::codec::FileMeta;
 use crate::error::Result;
 use crate::filter::{MemberFilter, NameTransformer};
 use crate::util::pathnorm::normalize_member_path;
@@ -21,6 +22,8 @@ pub struct PlannedEntry {
     pub size: u64,
     pub action: ActionKind,
     pub reason: String,
+    /// Source outer-member file info (mtime/attrs) when known from listing.
+    pub meta: FileMeta,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +117,7 @@ pub fn build_plan(
                 size: e.size,
                 action: ActionKind::Skip,
                 reason: "excluded by --exclude-outer".into(),
+                meta: e.meta.clone(),
             });
             continue;
         }
@@ -136,6 +140,7 @@ pub fn build_plan(
             size: e.size,
             action,
             reason,
+            meta: e.meta.clone(),
         });
     }
 
@@ -178,6 +183,7 @@ mod tests {
     fn meta(path: &str, format: ArchiveFormat) -> EntryMeta {
         EntryMeta {
             path: path.into(),
+            meta: Default::default(),
             size: 100,
             is_dir: false,
             format_hint: format,

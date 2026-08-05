@@ -284,6 +284,7 @@ pub fn convert_sevenz_file(
                 .and_then(|s| s.to_str())
                 .unwrap_or("x.7z"),
         ),
+        meta: Default::default(),
     };
     let conv = SevenZSolidToNonSolid;
     if !conv.matches(&entry) {

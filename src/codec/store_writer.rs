@@ -8,7 +8,7 @@
 //! uncompressed **tar** outer via [`OuterFormat::Tar`].
 
 use super::sevenz_header::{
-    write_raw_header, write_start_header, HeaderFile, SIG_HEADER_SIZE,
+    write_raw_header, write_start_header, FileMeta, HeaderFile, SIG_HEADER_SIZE,
 };
 use super::dir_writer::DirOuterWriter;
 use super::tar_writer::TarOuterWriter;
@@ -120,11 +120,29 @@ impl NonsolidStoreWriter {
     }
 
     /// Append raw file bytes as a stored pack stream (no recompression).
+    ///
+    /// Uses filesystem metadata of `src` for times/attributes.
     pub fn push_path(&mut self, name: String, src: &Path) -> Result<()> {
-        let meta = std::fs::metadata(src).map_err(|e| {
-            Error::Other(format!("stat {} for outer append: {e}", src.display()))
-        })?;
-        if meta.len() == 0 {
+        self.push_path_with_meta(name, src, None)
+    }
+
+    /// Append raw file bytes, preferring `file_meta` (source archive listing)
+    /// and filling any missing fields from the filesystem metadata of `src`.
+    pub fn push_path_with_meta(
+        &mut self,
+        name: String,
+        src: &Path,
+        file_meta: Option<FileMeta>,
+    ) -> Result<()> {
+        let fs_len = std::fs::metadata(src)
+            .map_err(|e| {
+                Error::Other(format!("stat {} for outer append: {e}", src.display()))
+            })?
+            .len();
+        let mut meta = file_meta.unwrap_or_default();
+        meta.merge_missing(&FileMeta::from_fs_path(src));
+
+        if fs_len == 0 {
             // Empty file: no pack stream; marked empty for FilesInfo.
             self.files.push(HeaderFile {
                 name,
@@ -135,6 +153,7 @@ impl NonsolidStoreWriter {
                 method_id: vec![0x00],
                 method_props: vec![],
                 empty: true,
+                meta,
             });
             return Ok(());
         }
@@ -164,12 +183,23 @@ impl NonsolidStoreWriter {
             method_id: vec![0x00], // Copy
             method_props: vec![],
             empty: false,
+            meta,
         });
         Ok(())
     }
 
-    /// Append an in-memory buffer as a stored member.
+    /// Append an in-memory buffer as a stored member (no times unless provided).
     pub fn push_bytes(&mut self, name: String, data: &[u8]) -> Result<()> {
+        self.push_bytes_with_meta(name, data, FileMeta::default())
+    }
+
+    /// Append an in-memory buffer with explicit file metadata.
+    pub fn push_bytes_with_meta(
+        &mut self,
+        name: String,
+        data: &[u8],
+        meta: FileMeta,
+    ) -> Result<()> {
         if data.is_empty() {
             self.files.push(HeaderFile {
                 name,
@@ -180,6 +210,7 @@ impl NonsolidStoreWriter {
                 method_id: vec![0x00],
                 method_props: vec![],
                 empty: true,
+                meta,
             });
             return Ok(());
         }
@@ -194,6 +225,7 @@ impl NonsolidStoreWriter {
             method_id: vec![0x00],
             method_props: vec![],
             empty: false,
+            meta,
         });
         Ok(())
     }
@@ -266,6 +298,16 @@ impl SyncedOuterWriter {
     }
 
     pub fn push_path(&self, name: String, src: &Path) -> Result<()> {
+        self.push_path_with_meta(name, src, None)
+    }
+
+    /// Append a member, preserving `file_meta` (source outer listing) when provided.
+    pub fn push_path_with_meta(
+        &self,
+        name: String,
+        src: &Path,
+        file_meta: Option<FileMeta>,
+    ) -> Result<()> {
         let mut g = self
             .inner
             .lock()
@@ -275,22 +317,33 @@ impl SyncedOuterWriter {
             src = %src.display(),
             outer = %self.path.display(),
             format = self.format.as_str(),
+            has_mtime = file_meta.as_ref().and_then(|m| m.mtime).is_some(),
             "appending member to outer"
         );
         match &mut *g {
-            OuterInner::SevenZ(w) => w.push_path(name, src),
+            OuterInner::SevenZ(w) => w.push_path_with_meta(name, src, file_meta),
+            // Tar/dir use FS metadata of `src` (extract/convert temps).
             OuterInner::Tar(w) => w.push_path(name, src),
             OuterInner::Dir(w) => w.push_path(name, src),
         }
     }
 
     pub fn push_bytes(&self, name: String, data: &[u8]) -> Result<()> {
+        self.push_bytes_with_meta(name, data, FileMeta::default())
+    }
+
+    pub fn push_bytes_with_meta(
+        &self,
+        name: String,
+        data: &[u8],
+        meta: FileMeta,
+    ) -> Result<()> {
         let mut g = self
             .inner
             .lock()
             .map_err(|_| Error::Other("outer writer mutex poisoned".into()))?;
         match &mut *g {
-            OuterInner::SevenZ(w) => w.push_bytes(name, data),
+            OuterInner::SevenZ(w) => w.push_bytes_with_meta(name, data, meta),
             OuterInner::Tar(w) => w.push_bytes(name, data),
             OuterInner::Dir(w) => w.push_bytes(name, data),
         }

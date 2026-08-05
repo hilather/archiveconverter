@@ -9,15 +9,20 @@
 //!     kUnpackInfo (kFolder…, kCodersUnpackSize…, kEnd)  // no folder CRCs
 //!     kSubStreamsInfo (kCRC all-defined content CRCs…, kEnd)
 //!     kEnd
-//!   kFilesInfo (num, [kEmptyStream], [kEmptyFile], kName, [kWinAttributes], kEnd)
+//!   kFilesInfo (num, [kEmptyStream], [kEmptyFile], kName, [times], [kWinAttributes], kEnd)
 //! kEnd
 //! ```
 //!
 //! Coder properties size is written as a single byte when `props.len() < 128`,
 //! matching sevenz-rust2 (`write_u8(props.len())`).
+//!
+//! File times and Windows attributes are written **only when defined** on each
+//! member (same rules as sevenz-rust2). Callers must supply source metadata;
+//! this writer does not invent a shared conversion-time timestamp.
 
 use crate::error::Result;
 use std::io::Write;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SIG: &[u8] = b"7z\xBC\xAF\x27\x1C";
@@ -37,12 +42,107 @@ pub const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
 pub const K_EMPTY_STREAM: u8 = 0x0E;
 pub const K_EMPTY_FILE: u8 = 0x0F;
 pub const K_NAME: u8 = 0x11;
+pub const K_C_TIME: u8 = 0x12;
+pub const K_A_TIME: u8 = 0x13;
 pub const K_M_TIME: u8 = 0x14;
 pub const K_WIN_ATTRIBUTES: u8 = 0x15;
 
 /// Windows FILE_ATTRIBUTE_ARCHIVE | (unix regular file mode in high word optional).
 /// 0x20 = ARCHIVE; high word 0o100644 << 16 for tools that read Unix bits.
+/// Used only as a last-resort default when packing synthetic test data with no source attrs.
 pub const ATTR_FILE: u32 = 0x20 | ((0o100644u32) << 16);
+
+/// Per-member file information for 7z FilesInfo (times + Windows attributes).
+///
+/// Times are Windows FILETIME (100ns ticks since 1601-01-01 UTC).
+/// `None` means the property is not defined for that member (omit from the bitset).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileMeta {
+    pub mtime: Option<u64>,
+    pub ctime: Option<u64>,
+    pub atime: Option<u64>,
+    pub windows_attributes: Option<u32>,
+}
+
+impl FileMeta {
+    /// Build metadata from filesystem timestamps/mode of `path`.
+    pub fn from_fs_path(path: &Path) -> Self {
+        let mut m = Self::default();
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(t) = meta.modified() {
+                m.mtime = system_time_to_filetime(t);
+            }
+            if let Ok(t) = meta.created() {
+                m.ctime = system_time_to_filetime(t);
+            }
+            if let Ok(t) = meta.accessed() {
+                m.atime = system_time_to_filetime(t);
+            }
+            m.windows_attributes = Some(attrs_from_fs_meta(&meta));
+        }
+        m
+    }
+
+    /// True when at least one field is set.
+    pub fn is_empty(&self) -> bool {
+        self.mtime.is_none()
+            && self.ctime.is_none()
+            && self.atime.is_none()
+            && self.windows_attributes.is_none()
+    }
+
+    /// Prefer `self` fields; fill gaps from `other`.
+    pub fn merge_missing(&mut self, other: &FileMeta) {
+        if self.mtime.is_none() {
+            self.mtime = other.mtime;
+        }
+        if self.ctime.is_none() {
+            self.ctime = other.ctime;
+        }
+        if self.atime.is_none() {
+            self.atime = other.atime;
+        }
+        if self.windows_attributes.is_none() {
+            self.windows_attributes = other.windows_attributes;
+        }
+    }
+}
+
+/// Convert `SystemTime` to Windows FILETIME, or `None` if before Unix epoch / unrepresentable.
+pub fn system_time_to_filetime(t: SystemTime) -> Option<u64> {
+    let d = t.duration_since(UNIX_EPOCH).ok()?;
+    let secs = d.as_secs();
+    let nanos = d.subsec_nanos() as u64;
+    // 11644473600 seconds between 1601-01-01 and 1970-01-01
+    let ft_secs = secs.checked_add(11_644_473_600)?;
+    let ft = ft_secs
+        .checked_mul(10_000_000)?
+        .checked_add(nanos / 100)?;
+    Some(ft)
+}
+
+/// Current time as Windows FILETIME (100ns since 1601-01-01).
+/// Prefer per-file source metadata; only for synthetic fixtures without a source.
+#[allow(dead_code)]
+pub fn filetime_now() -> u64 {
+    system_time_to_filetime(SystemTime::now()).unwrap_or(0)
+}
+
+fn attrs_from_fs_meta(meta: &std::fs::Metadata) -> u32 {
+    // ARCHIVE bit always; high word carries a rough Unix mode when available.
+    let mut attr: u32 = 0x20; // FILE_ATTRIBUTE_ARCHIVE
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        // 7-Zip convention: Unix mode in high 16 bits of Windows attributes.
+        attr |= (mode & 0xFFFF) << 16;
+    }
+    if meta.is_dir() {
+        attr |= 0x10; // FILE_ATTRIBUTE_DIRECTORY
+    }
+    attr
+}
 
 /// One non-directory file member in a non-solid multi-file 7z.
 #[derive(Debug, Clone)]
@@ -62,6 +162,8 @@ pub struct HeaderFile {
     pub method_props: Vec<u8>,
     /// If true, file has no pack stream (empty file).
     pub empty: bool,
+    /// Source file times / attributes (written only when defined).
+    pub meta: FileMeta,
 }
 
 /// Write raw header bytes (starts with kHeader, ends with kEnd of header).
@@ -103,16 +205,6 @@ pub fn write_start_header(
     let start_crc = crc32fast::hash(&sig[12..]);
     sig[8..12].copy_from_slice(&start_crc.to_le_bytes());
     sig
-}
-
-/// Current time as Windows FILETIME (100ns since 1601-01-01).
-pub fn filetime_now() -> u64 {
-    let unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // 11644473600 seconds between 1601 and 1970
-    (unix.saturating_add(11_644_473_600)) * 10_000_000
 }
 
 fn write_pack_info(h: &mut Vec<u8>, files: &[&HeaderFile]) -> Result<()> {
@@ -225,34 +317,74 @@ fn write_files_info(h: &mut Vec<u8>, files: &[HeaderFile], has_empty: bool) -> R
     write_u64(h, names.len() as u64)?;
     h.extend_from_slice(&names);
 
-    // MTime (all defined) — helps mounters that surface timestamps.
-    h.push(K_M_TIME);
-    {
-        let mut body = Vec::new();
-        body.push(1); // all defined
-        body.push(0); // external = 0
-        let ft = filetime_now();
-        for _ in files {
-            body.extend_from_slice(&ft.to_le_bytes());
-        }
-        write_u64(h, body.len() as u64)?;
-        h.extend_from_slice(&body);
-    }
-
-    // Windows attributes (all defined)
-    h.push(K_WIN_ATTRIBUTES);
-    {
-        let mut body = Vec::new();
-        body.push(1); // all defined
-        body.push(0); // external = 0
-        for _ in files {
-            body.extend_from_slice(&ATTR_FILE.to_le_bytes());
-        }
-        write_u64(h, body.len() as u64)?;
-        h.extend_from_slice(&body);
-    }
+    // Optional times / attributes — only when at least one member defines them.
+    write_optional_u64_prop(h, K_C_TIME, files, |f| f.meta.ctime)?;
+    write_optional_u64_prop(h, K_A_TIME, files, |f| f.meta.atime)?;
+    write_optional_u64_prop(h, K_M_TIME, files, |f| f.meta.mtime)?;
+    write_optional_u32_prop(h, K_WIN_ATTRIBUTES, files, |f| f.meta.windows_attributes)?;
 
     h.push(K_END);
+    Ok(())
+}
+
+/// Write a FilesInfo property of u64 values (times), matching sevenz-rust2 layout.
+fn write_optional_u64_prop(
+    h: &mut Vec<u8>,
+    prop_id: u8,
+    files: &[HeaderFile],
+    get: impl Fn(&HeaderFile) -> Option<u64>,
+) -> Result<()> {
+    let defined: Vec<bool> = files.iter().map(|f| get(f).is_some()).collect();
+    let num_defined = defined.iter().filter(|d| **d).count();
+    if num_defined == 0 {
+        return Ok(());
+    }
+    h.push(prop_id);
+    let mut body = Vec::new();
+    if num_defined == files.len() {
+        body.push(1); // all defined
+    } else {
+        body.push(0);
+        body.extend_from_slice(&bitset_bytes(files.len(), |i| defined[i]));
+    }
+    body.push(0); // external = 0
+    for f in files {
+        if let Some(v) = get(f) {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    write_u64(h, body.len() as u64)?;
+    h.extend_from_slice(&body);
+    Ok(())
+}
+
+fn write_optional_u32_prop(
+    h: &mut Vec<u8>,
+    prop_id: u8,
+    files: &[HeaderFile],
+    get: impl Fn(&HeaderFile) -> Option<u32>,
+) -> Result<()> {
+    let defined: Vec<bool> = files.iter().map(|f| get(f).is_some()).collect();
+    let num_defined = defined.iter().filter(|d| **d).count();
+    if num_defined == 0 {
+        return Ok(());
+    }
+    h.push(prop_id);
+    let mut body = Vec::new();
+    if num_defined == files.len() {
+        body.push(1); // all defined
+    } else {
+        body.push(0);
+        body.extend_from_slice(&bitset_bytes(files.len(), |i| defined[i]));
+    }
+    body.push(0); // external = 0
+    for f in files {
+        if let Some(v) = get(f) {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    write_u64(h, body.len() as u64)?;
+    h.extend_from_slice(&body);
     Ok(())
 }
 
@@ -316,6 +448,11 @@ mod tests {
             method_id: vec![0x00],
             method_props: vec![],
             empty: false,
+            meta: FileMeta {
+                mtime: Some(0x01D5C0_5A_A0_00_0000),
+                windows_attributes: Some(ATTR_FILE),
+                ..Default::default()
+            },
         }];
         let mut h = Vec::new();
         write_raw_header(&mut h, &files).unwrap();
@@ -324,5 +461,34 @@ mod tests {
         assert!(h.contains(&K_SUB_STREAMS_INFO));
         assert!(h.contains(&K_WIN_ATTRIBUTES));
         assert!(h.contains(&K_M_TIME));
+    }
+
+    #[test]
+    fn header_omits_times_when_undefined() {
+        let files = vec![HeaderFile {
+            name: "a.txt".into(),
+            pack_size: 4,
+            pack_crc: 1,
+            unpack_size: 4,
+            content_crc: 2,
+            method_id: vec![0x00],
+            method_props: vec![],
+            empty: false,
+            meta: FileMeta::default(),
+        }];
+        let mut h = Vec::new();
+        write_raw_header(&mut h, &files).unwrap();
+        assert!(!h.contains(&K_M_TIME), "must not invent mtime when undefined");
+        assert!(
+            !h.contains(&K_WIN_ATTRIBUTES),
+            "must not invent attrs when undefined"
+        );
+    }
+
+    #[test]
+    fn system_time_roundtrip_epoch() {
+        let ft = system_time_to_filetime(UNIX_EPOCH).unwrap();
+        // Unix epoch FILETIME = 11644473600 * 10_000_000
+        assert_eq!(ft, 11_644_473_600 * 10_000_000);
     }
 }

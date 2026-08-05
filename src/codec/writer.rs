@@ -1,11 +1,12 @@
 //! Minimal non-solid multi-file 7z writer for precompressed LZMA2 streams.
 //!
 //! Headers follow sevenz-rust2 / 7-Zip layout (substream CRCs, no folder CRCs,
-//! names + mtime + win attributes) so ratarmount / ratarmount-rs / py7zr parse
-//! and stream members correctly.
+//! names + optional mtime + win attributes) so ratarmount / ratarmount-rs / py7zr
+//! parse and stream members correctly. Callers must supply source file metadata
+//! when preservation is required.
 
 use super::sevenz_header::{
-    write_raw_header, write_start_header, HeaderFile, SIG_HEADER_SIZE,
+    write_raw_header, write_start_header, FileMeta, HeaderFile, SIG_HEADER_SIZE,
 };
 use super::Lzma2Compressed;
 use crate::error::{Error, Result};
@@ -17,6 +18,8 @@ use std::path::Path;
 pub struct PackedEntry {
     pub name: String,
     pub compressed: Lzma2Compressed,
+    /// Source member metadata (mtime / attrs); empty = omit from header.
+    pub meta: FileMeta,
 }
 
 /// Streaming non-solid 7z writer: packs are appended immediately; header last.
@@ -42,7 +45,12 @@ impl NonsolidLzma2Writer {
     }
 
     /// Append one precompressed pack stream and record header metadata.
-    pub fn push_packed(&mut self, name: String, compressed: Lzma2Compressed) -> Result<()> {
+    pub fn push_packed(
+        &mut self,
+        name: String,
+        compressed: Lzma2Compressed,
+        meta: FileMeta,
+    ) -> Result<()> {
         let pack_crc = crc32fast::hash(&compressed.data);
         let pack_size = compressed.data.len() as u64;
         self.file.write_all(&compressed.data)?;
@@ -55,12 +63,13 @@ impl NonsolidLzma2Writer {
             method_id: vec![0x21], // LZMA2
             method_props: vec![compressed.props],
             empty: compressed.uncompressed_size == 0 && pack_size == 0,
+            meta,
         });
         Ok(())
     }
 
     pub fn push_entry(&mut self, entry: PackedEntry) -> Result<()> {
-        self.push_packed(entry.name, entry.compressed)
+        self.push_packed(entry.name, entry.compressed, entry.meta)
     }
 
     pub fn len(&self) -> usize {
@@ -110,6 +119,7 @@ pub fn write_nonsolid_lzma2(path: &Path, entries: &[PackedEntry]) -> Result<()> 
                 crc32: e.compressed.crc32,
                 uncompressed_size: e.compressed.uncompressed_size,
             },
+            e.meta.clone(),
         )?;
     }
     w.finish()
@@ -133,10 +143,20 @@ mod tests {
             PackedEntry {
                 name: "a.txt".into(),
                 compressed: a,
+                meta: FileMeta {
+                    mtime: Some(100_000_000_000_000),
+                    windows_attributes: Some(0x20),
+                    ..Default::default()
+                },
             },
             PackedEntry {
                 name: "b.txt".into(),
                 compressed: b,
+                meta: FileMeta {
+                    mtime: Some(200_000_000_000_000),
+                    windows_attributes: Some(0x20),
+                    ..Default::default()
+                },
             },
         ];
         let out = dir.path().join("out.7z");
@@ -149,6 +169,10 @@ mod tests {
                 assert!(names.iter().any(|n| n.ends_with("a.txt")), "{names:?}");
                 assert!(names.iter().any(|n| n.ends_with("b.txt")), "{names:?}");
                 assert!(!native.is_solid(&out).unwrap());
+                let a_meta = list.iter().find(|e| e.path.ends_with("a.txt")).unwrap();
+                assert_eq!(a_meta.meta.mtime, Some(100_000_000_000_000));
+                let b_meta = list.iter().find(|e| e.path.ends_with("b.txt")).unwrap();
+                assert_eq!(b_meta.meta.mtime, Some(200_000_000_000_000));
             }
             Err(e) => {
                 if let Ok(bin) = crate::archive::sevenz::find_7z_binary() {
@@ -174,7 +198,15 @@ mod tests {
         for i in 0..20 {
             let data = format!("payload-{i}-{}", "x".repeat(50));
             let c = codec.compress(data.as_bytes(), 1).unwrap();
-            w.push_packed(format!("f{i:02}.txt"), c).unwrap();
+            w.push_packed(
+                format!("f{i:02}.txt"),
+                c,
+                FileMeta {
+                    mtime: Some(1_000_000_000_000 + i as u64),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
@@ -198,7 +230,8 @@ mod tests {
         let out = dir.path().join("paths.7z");
         let mut w = NonsolidLzma2Writer::create(&out).unwrap();
         let c = codec.compress(b"in subdir", 1).unwrap();
-        w.push_packed("sub/dir/x.txt".into(), c).unwrap();
+        w.push_packed("sub/dir/x.txt".into(), c, FileMeta::default())
+            .unwrap();
         w.finish().unwrap();
         let native = NativeSevenZ::new();
         native.test(&out).unwrap();

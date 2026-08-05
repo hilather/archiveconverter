@@ -2,6 +2,7 @@
 
 use super::detect::format_from_path;
 use super::{ArchiveBackend, ArchiveFormat, EntryMeta, PackOptions};
+use crate::codec::FileMeta;
 use crate::error::{Error, Result};
 use crate::util::pathnorm::normalize_member_path;
 use std::fs;
@@ -373,29 +374,43 @@ pub fn parse_ba_listing(text: &str) -> Result<Vec<EntryMeta>> {
         } else {
             format_from_path(&path)
         };
+        // BA listing has local Date/Time; we do not invent FILETIME from it
+        // (timezone-ambiguous). Pipeline uses FS mtime after extract instead.
+        let mut meta = FileMeta::default();
+        // ARCHIVE bit when attr contains 'A' (common 7z listing form ....A).
+        if attr.contains('A') {
+            meta.windows_attributes = Some(0x20);
+        }
         entries.push(EntryMeta {
             path,
             size,
             is_dir,
             format_hint,
+            meta,
         });
     }
     Ok(entries)
 }
 
 /// Parse `-slt` listing output into entries (files only; dirs optional).
+///
+/// Captures Windows attributes when present. Modified/Created/Accessed are
+/// display strings in local time and are **not** converted to FILETIME here
+/// (ambiguous); prefer the native reader or post-extract FS mtimes for exact times.
 pub fn parse_slt_listing(text: &str) -> Result<Vec<EntryMeta>> {
     let mut entries = Vec::new();
     let mut path: Option<String> = None;
     let mut size: u64 = 0;
     let mut is_dir = false;
     let mut in_entry = false;
+    let mut meta = FileMeta::default();
 
     let flush = |entries: &mut Vec<EntryMeta>,
                  path: &mut Option<String>,
                  size: &mut u64,
                  is_dir: &mut bool,
-                 in_entry: &mut bool| {
+                 in_entry: &mut bool,
+                 meta: &mut FileMeta| {
         if *in_entry {
             if let Some(p) = path.take() {
                 let p = normalize_member_path(&p);
@@ -410,6 +425,7 @@ pub fn parse_slt_listing(text: &str) -> Result<Vec<EntryMeta>> {
                         size: *size,
                         is_dir: *is_dir,
                         format_hint,
+                        meta: std::mem::take(meta),
                     });
                 }
             }
@@ -417,6 +433,7 @@ pub fn parse_slt_listing(text: &str) -> Result<Vec<EntryMeta>> {
         *size = 0;
         *is_dir = false;
         *in_entry = false;
+        *meta = FileMeta::default();
     };
 
     for line in text.lines() {
@@ -427,6 +444,7 @@ pub fn parse_slt_listing(text: &str) -> Result<Vec<EntryMeta>> {
                 &mut size,
                 &mut is_dir,
                 &mut in_entry,
+                &mut meta,
             );
             let p = line.trim_start_matches("Path = ").to_string();
             // First Path is often the archive itself when not using -ba; with -ba each is a member
@@ -446,6 +464,10 @@ pub fn parse_slt_listing(text: &str) -> Result<Vec<EntryMeta>> {
             if v.starts_with('D') {
                 is_dir = true;
             }
+            // Prefer ARCHIVE bit when listed as `A ...` form.
+            if v.contains('A') {
+                meta.windows_attributes = Some(0x20);
+            }
         }
     }
     flush(
@@ -454,6 +476,7 @@ pub fn parse_slt_listing(text: &str) -> Result<Vec<EntryMeta>> {
         &mut size,
         &mut is_dir,
         &mut in_entry,
+        &mut meta,
     );
 
     // Drop the archive path itself if it slipped in (no extension path equal to full file)

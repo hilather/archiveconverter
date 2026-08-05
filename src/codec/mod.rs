@@ -14,6 +14,7 @@ mod writer;
 pub use dir_writer::{count_dir_files, default_dir_from_input, DirOuterWriter};
 pub use liblzma_codec::LibLzmaCodec;
 pub use pure_rust::PureRustCodec;
+pub use sevenz_header::{system_time_to_filetime, FileMeta, ATTR_FILE};
 pub use store_writer::{NonsolidStoreWriter, OuterFormat, SyncedOuterWriter};
 pub use tar_writer::{count_tar_files, TarOuterWriter};
 pub use writer::{write_nonsolid_lzma2, NonsolidLzma2Writer, PackedEntry};

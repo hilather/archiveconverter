@@ -8,7 +8,7 @@
 use super::detect::format_from_path;
 use super::{ArchiveBackend, ArchiveFormat, EntryMeta, PackOptions};
 use crate::codec::{
-    open_codec, CodecKind, Lzma2Codec, Lzma2Compressed, NonsolidLzma2Writer,
+    open_codec, CodecKind, FileMeta, Lzma2Codec, Lzma2Compressed, NonsolidLzma2Writer,
 };
 use crate::error::{Error, Result};
 use crate::filter::MemberFilter;
@@ -221,6 +221,7 @@ impl NativeSevenZ {
                         skipped += 1;
                         return Ok(true);
                     }
+                    let meta = file_meta_from_entry(entry);
                     let mut buf = Vec::with_capacity(entry.size.min(8 << 20) as usize);
                     io::copy(r, &mut buf).map_err(sevenz_rust2::Error::from)?;
                     // Blocks when `workers` jobs are already in flight.
@@ -229,6 +230,7 @@ impl NativeSevenZ {
                             id,
                             name: path,
                             data: buf,
+                            meta,
                         })
                         .is_err()
                     {
@@ -264,6 +266,7 @@ impl NativeSevenZ {
                                 id: job.id,
                                 name: job.name,
                                 compressed,
+                                meta: job.meta,
                             })
                             .map_err(|_| Error::Other("p3 result channel closed".into()))?;
                         Ok(())
@@ -280,7 +283,7 @@ impl NativeSevenZ {
         for item in res_rx {
             pending.insert(item.id, item);
             while let Some(done) = pending.remove(&next_id) {
-                writer.push_packed(done.name, done.compressed)?;
+                writer.push_packed(done.name, done.compressed, done.meta)?;
                 next_id += 1;
             }
         }
@@ -412,6 +415,7 @@ impl NativeSevenZ {
                             skipped += 1;
                             return Ok(true);
                         }
+                        let meta = file_meta_from_entry(entry);
                         let mut buf = Vec::with_capacity(entry.size.min(8 << 20) as usize);
                         io::copy(r, &mut buf).map_err(sevenz_rust2::Error::from)?;
                         let size = buf.len() as u64;
@@ -421,6 +425,7 @@ impl NativeSevenZ {
                                 path,
                                 data: buf,
                                 size,
+                                meta,
                             })
                             .is_err()
                         {
@@ -448,7 +453,7 @@ impl NativeSevenZ {
                 Lzma2Options::from_level(level).into()
             };
             writer.set_content_methods(vec![cfg]);
-            let ae = ArchiveEntry::new_file(&item.path);
+            let ae = archive_entry_with_meta(&item.path, &item.meta);
             writer
                 .push_archive_entry(ae, Some(Cursor::new(item.data)))
                 .map_err(map_err)?;
@@ -474,6 +479,7 @@ struct DecodedEntry {
     path: String,
     data: Vec<u8>,
     size: u64,
+    meta: FileMeta,
 }
 
 /// One decoded file waiting for LZMA2 encode (Phase 3 window).
@@ -481,6 +487,7 @@ struct EncodeJob {
     id: usize,
     name: String,
     data: Vec<u8>,
+    meta: FileMeta,
 }
 
 /// Compressed pack ready to append (Phase 3).
@@ -488,6 +495,53 @@ struct EncodeResult {
     id: usize,
     name: String,
     compressed: Lzma2Compressed,
+    meta: FileMeta,
+}
+
+fn file_meta_from_entry(entry: &ArchiveEntry) -> FileMeta {
+    FileMeta {
+        mtime: if entry.has_last_modified_date {
+            Some(u64::from(entry.last_modified_date))
+        } else {
+            None
+        },
+        ctime: if entry.has_creation_date {
+            Some(u64::from(entry.creation_date))
+        } else {
+            None
+        },
+        atime: if entry.has_access_date {
+            Some(u64::from(entry.access_date))
+        } else {
+            None
+        },
+        windows_attributes: if entry.has_windows_attributes {
+            Some(entry.windows_attributes)
+        } else {
+            None
+        },
+    }
+}
+
+fn archive_entry_with_meta(path: &str, meta: &FileMeta) -> ArchiveEntry {
+    let mut ae = ArchiveEntry::new_file(path);
+    if let Some(t) = meta.mtime {
+        ae.has_last_modified_date = true;
+        ae.last_modified_date = t.into();
+    }
+    if let Some(t) = meta.ctime {
+        ae.has_creation_date = true;
+        ae.creation_date = t.into();
+    }
+    if let Some(t) = meta.atime {
+        ae.has_access_date = true;
+        ae.access_date = t.into();
+    }
+    if let Some(a) = meta.windows_attributes {
+        ae.has_windows_attributes = true;
+        ae.windows_attributes = a;
+    }
+    ae
 }
 
 fn process_entry_stream(
@@ -511,11 +565,12 @@ fn process_entry_stream(
     }
 
     // Buffer so we can pick ST vs MT encode from actual size.
+    let meta = file_meta_from_entry(entry);
     let mut buf = Vec::with_capacity(entry.size.min(8 << 20) as usize);
     io::copy(r, &mut buf).map_err(sevenz_rust2::Error::from)?;
     let size = buf.len() as u64;
     writer.set_content_methods(vec![native.lzma2_config_for_size(pack, size)]);
-    let ae = ArchiveEntry::new_file(&path);
+    let ae = archive_entry_with_meta(&path, &meta);
     writer
         .push_archive_entry(ae, Some(Cursor::new(buf)))
         .map_err(|e| {
@@ -561,6 +616,7 @@ impl ArchiveBackend for NativeSevenZ {
                 size: f.size,
                 is_dir,
                 format_hint,
+                meta: file_meta_from_entry(f),
             });
         }
         Ok(out)
@@ -664,7 +720,7 @@ impl ArchiveBackend for NativeSevenZ {
                 .map(|e| e.into_path())
                 .collect();
 
-            let mut items: Vec<(String, Vec<u8>)> = if self.options.parallel_pack_read
+            let mut items: Vec<(String, Vec<u8>, FileMeta)> = if self.options.parallel_pack_read
                 && paths.len() > 32
             {
                 use rayon::prelude::*;
@@ -680,8 +736,9 @@ impl ArchiveBackend for NativeSevenZ {
                         if !is_safe_member_path(&rel) {
                             return None;
                         }
+                        let meta = FileMeta::from_fs_path(path);
                         let data = fs::read(path).ok()?;
-                        Some((rel, data))
+                        Some((rel, data, meta))
                     })
                     .collect()
             } else {
@@ -696,7 +753,8 @@ impl ArchiveBackend for NativeSevenZ {
                     if !is_safe_member_path(&rel) {
                         continue;
                     }
-                    v.push((rel, fs::read(path)?));
+                    let meta = FileMeta::from_fs_path(path);
+                    v.push((rel, fs::read(path)?, meta));
                 }
                 v
             };
@@ -704,10 +762,10 @@ impl ArchiveBackend for NativeSevenZ {
             // Stable order for reproducible archives
             items.sort_by(|a, b| a.0.cmp(&b.0));
 
-            for (rel, data) in items {
+            for (rel, data, meta) in items {
                 let size = data.len() as u64;
                 writer.set_content_methods(vec![self.lzma2_config_for_size(opts, size)]);
-                let ae = ArchiveEntry::new_file(&rel);
+                let ae = archive_entry_with_meta(&rel, &meta);
                 writer
                     .push_archive_entry(ae, Some(Cursor::new(data)))
                     .map_err(map_err)?;
