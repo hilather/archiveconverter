@@ -40,9 +40,9 @@ Nested *content* is still compressed 7z; only the **outer container** and **soli
 | **Outer writer** | Streaming append under a mutex — **no final recompress** of the outer |
 | **Solid outer extract** | Single-pass bulk extract of needed members (default) |
 | **Passthrough** | Already non-solid nested archives can be copied when filters are empty |
-| **Filters** | Regex exclude inner/outer; ordered rename rules; basename-only match |
-| **7z excludes** | Common regexes mapped to `7z -x!` globs when possible |
-| **Corrupt nests** | Skipped with a warning; rest of the outer still completes |
+| **Filters** | Regex exclude/include **and** rsync filter files/rules (first-match; dir prune) |
+| **7z excludes** | Common regexes / simple rsync excludes mapped to `7z -x!` globs when possible |
+| **Corrupt / unexpected members** | Skipped with a warning; rest of the outer still completes |
 | **Backends** | `cli` (default) or `native` (streaming Phase 1–3 pipelines) |
 | **Native Phase 3** | Windowed parallel LZMA2 (`liblzma` or pure-rust); packs stream out; bounded RAM |
 | **Headers** | Custom non-solid writers aligned for 7zz / sevenz-rust2 / common mounters |
@@ -97,6 +97,12 @@ archiveconverter convert outer.7z -o out.7z \
   --rename '_old\.7z$=.7z' \
   --threads 4 --level 1 --verify
 
+# Same filters as rsync files/rules (first-match; dir prune)
+archiveconverter convert outer.7z -o out.7z \
+  --exclude-from-outer skip.excludes \
+  --filter-inner '- *.tmp' \
+  --filter-inner '- __MACOSX/'
+
 # Outer as uncompressed tar
 archiveconverter convert outer.7z -o out.tar --outer-format tar --level 1 --verify
 # extension alone also selects tar:
@@ -135,10 +141,13 @@ archiveconverter convert-single solid.7z -o out.7z \
 |------|---------|---------|
 | `-o`, `--output` | required for 7z/tar; optional for `dir` | Output file or directory |
 | `--outer-format` | inferred | `7z` \| `tar` \| `dir`. Omit: `.tar` → tar; path ends with `/` → dir; else 7z |
-| `--exclude-inner` | — | Regex; drop paths **inside** each nested 7z (repeatable) |
-| `--exclude-outer` | — | Regex; drop outer members (repeatable) |
+| `--exclude-inner` / `--exclude-outer` | — | Regex exclude (repeatable); appended after rsync rules |
+| `--include-inner` / `--include-outer` | — | Regex include (repeatable); first-match with excludes |
+| `--filter-inner` / `--filter-outer` | — | Rsync rule: `+ pat`, `- pat`, or bare exclude |
+| `--filter-from-inner` / `--filter-from-outer` | — | Rsync filter file (`#` comments, `merge`, `clear`) |
+| `--include-from-*` / `--exclude-from-*` | — | Rsync include-from / exclude-from (one pattern per line) |
 | `--rename` | — | `PATTERN=REPL` on outer names (ordered; `$1` / `$name`) |
-| `--basename-match` | off | Match excludes on basename only |
+| `--basename-match` | off | Regex excludes/includes match basename only (rsync keeps its own `/` rules) |
 | `--level` | `5` | Nested pack level 0–9 |
 | `--threads` | auto | Nest workers + pack MT when nests ≥ 2; single nest forces pack = 1 |
 | `--nested-concurrency` | `0` (auto) | Max nests converting at once |
@@ -156,7 +165,26 @@ archiveconverter convert-single solid.7z -o out.7z \
 | `--no-pipeline-overlap` | off | Disable extract/convert prefetch |
 | `-v` / `-vv` | info | Debug / trace logging |
 
-Path matching uses `/`-normalized paths (Rust `regex`).
+Path matching uses `/`-normalized paths. **Regex** flags use Rust `regex`. **Rsync** flags follow `rsync(1)` include/exclude rules (see below).
+
+### Rsync filter rules
+
+Rules are checked **in order**; the first match wins. Unmatched paths are **kept** (rsync default). An include-only list is not a whitelist — pair `+ *.txt` with `- *` to keep only text files.
+
+| Pattern | Meaning |
+|---------|---------|
+| `*.tmp` (no `/`) | Match the **basename** (any directory) |
+| `nested/skip.7z` | Match that full path |
+| `/skip.7z` | Match `skip.7z` at the archive root only |
+| `secret/` | Directories named `secret` only; children are pruned (rsync would not recurse) |
+| `secret/***` | `secret` and everything under it |
+| `*` / `?` / `[abc]` | Non-`/` wildcards; `**` also matches `/` |
+
+Filter files accept `#` / `;` comments, `+`/`-`/`include`/`exclude`, `merge` / `.` (inlined), and `clear` / `!`. `dir-merge` / `:` is treated as `merge` (archives have no live per-directory walk).
+
+CLI assembly order for each side (inner / outer): `--filter-from` → `--filter` → `--include-from` → `--exclude-from` → regex `--include-*` → regex `--exclude-*`. Put mixed include/exclude sequences in a filter file when order matters.
+
+`convert-single` has the same rsync flags without the `-inner`/`-outer` suffix (`--filter`, `--filter-from`, `--include-from`, `--exclude-from`).
 
 ### Outer formats
 
@@ -191,12 +219,12 @@ input outer.7z
 | `convert` | Registry; `7z-solid-to-nonsolid` (+ zip stub) |
 | `archive` | CLI + native backends |
 | `codec` | Store/tar/dir outer writers, Phase 3 LZMA2, headers |
-| `filter` | Exclude + rename |
+| `filter` | Regex + rsync include/exclude + rename |
 | `bin/bench_nested` | Fixture scales + timing + manual baselines |
 
 **Disk model:** nested converts are concurrent only within the size budget; each nest’s unpack tree is scrubbed when done. Outer packs are appended, not rebuilt.
 
-**Failure model:** a corrupt nested archive is **skipped** (stderr warning + log); other members still land in the output.
+**Failure model:** a corrupt nested archive, a passthrough that will not extract, an unsafe/duplicate member path, or a bulk-extract failure (falls back to per-member) is **skipped** (stderr warning + log). Other members still land in the output. The job fails only if **nothing** usable remains to write.
 
 ---
 
@@ -323,7 +351,7 @@ src/
   convert/      # converters
   archive/      # cli + native backends
   codec/        # outer 7z/tar/dir, Phase 3 codecs, headers
-  filter/       # exclude + rename
+  filter/       # regex + rsync filters, rename
   util/         # threads, size parse, temp, cleanup
   bin/bench_nested.rs
 tests/          # e2e, cli smoke, compare_7z_cli, phase bakeoffs

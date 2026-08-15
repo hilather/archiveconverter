@@ -245,3 +245,96 @@ fn corrupt_nested_is_skipped_others_succeed() {
         "corrupt nested must not be in output: {paths:?}"
     );
 }
+
+/// Unsafe rename dest is skipped; other members still land in the output.
+#[test]
+fn unsafe_passthrough_rename_is_skipped_others_succeed() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    let out = root.path().join("converted.7z");
+
+    let mut opts = PipelineOptions::new(outer, out.clone());
+    opts.exclude_outer = MemberFilter::with_excludes([r"^skip_me\.7z$"]).unwrap();
+    opts.rename = NameTransformer::from_pairs([
+        r"_old\.7z$=.7z",
+        r"^readme\.txt$=../evil.txt",
+    ])
+    .unwrap();
+    opts.verify = true;
+    opts.pack = default_pack();
+    opts.temp_dir = Some(root.path().join("tmp"));
+
+    let plan = pipeline::run(&backend(), &opts).expect("convert should succeed");
+    assert!(
+        plan.entries
+            .iter()
+            .any(|e| e.source_path == "readme.txt" && e.action == archiveconverter::pipeline::ActionKind::Skip),
+        "unsafe rename should be planned as skip"
+    );
+    assert_eq!(plan.runtime.passthrough_written, 0);
+    let paths = list_file_paths(&backend(), &out).unwrap();
+    assert!(paths.iter().any(|p| p.ends_with("alpha.7z")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("beta.7z")), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.contains("readme") || p.contains("evil")),
+        "unsafe passthrough must not be in output: {paths:?}"
+    );
+}
+
+/// Rsync filter-from / exclude-from on outer + inner (first-match, dir prune).
+#[test]
+fn rsync_filter_files_outer_and_inner() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    let out = root.path().join("converted.7z");
+
+    let outer_rules = root.path().join("outer.rules");
+    fs::write(&outer_rules, "skip_me.7z\n").unwrap();
+    let inner_rules = root.path().join("inner.filter");
+    fs::write(&inner_rules, "- *.tmp\n- __MACOSX/\n").unwrap();
+
+    let mut exclude_outer = MemberFilter::new();
+    exclude_outer.add_exclude_from(&outer_rules).unwrap();
+    let mut exclude_inner = MemberFilter::new();
+    exclude_inner.add_filter_from(&inner_rules).unwrap();
+
+    let mut opts = PipelineOptions::new(outer, out.clone());
+    opts.exclude_outer = exclude_outer;
+    opts.exclude_inner = exclude_inner;
+    opts.rename = NameTransformer::from_pairs([r"_old\.7z$=.7z"]).unwrap();
+    opts.verify = true;
+    opts.pack = default_pack();
+    opts.temp_dir = Some(root.path().join("tmp"));
+
+    let plan = pipeline::run(&backend(), &opts).expect("rsync filters");
+    assert_eq!(plan.skip_count(), 1);
+    assert_eq!(plan.runtime.nested_converted, 2);
+    assert_eq!(plan.runtime.passthrough_written, 1);
+
+    let outer_paths = list_file_paths(&backend(), &out).unwrap();
+    assert!(outer_paths.iter().any(|p| p == "alpha.7z"), "{outer_paths:?}");
+    assert!(
+        !outer_paths.iter().any(|p| p.contains("skip_me")),
+        "{outer_paths:?}"
+    );
+
+    let alpha_out = root.path().join("alpha-extracted.7z");
+    backend()
+        .extract_member(&out, "alpha.7z", &alpha_out)
+        .unwrap();
+    let inner_paths = list_file_paths(&backend(), &alpha_out).unwrap();
+    assert!(
+        !inner_paths.iter().any(|p| p.ends_with(".tmp")),
+        "rsync *.tmp: {inner_paths:?}"
+    );
+    assert!(
+        !inner_paths.iter().any(|p| p.contains("__MACOSX")),
+        "rsync __MACOSX/: {inner_paths:?}"
+    );
+    assert!(
+        inner_paths.iter().any(|p| p.ends_with("hello.txt")),
+        "{inner_paths:?}"
+    );
+}

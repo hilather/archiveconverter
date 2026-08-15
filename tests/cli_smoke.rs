@@ -186,3 +186,38 @@ fn convert_single_cli() {
 
     assert!(out.is_file());
 }
+
+#[test]
+fn convert_rsync_filter_from_cli() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    let out = root.path().join("out.7z");
+    let rules = root.path().join("outer.rules");
+    fs::write(&rules, "skip_me.7z\n").unwrap();
+
+    bin()
+        .args([
+            "convert",
+            outer.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--exclude-from-outer",
+            rules.to_str().unwrap(),
+            "--filter-inner",
+            "- *.tmp",
+            "--filter-inner",
+            "- __MACOSX/",
+            "--rename",
+            r"_old\.7z$=.7z",
+            "--verify",
+            "--level",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote"));
+
+    assert!(out.is_file());
+    assert_archive_ok(&out);
+}

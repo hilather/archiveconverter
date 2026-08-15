@@ -129,10 +129,10 @@ pub fn count_dir_files(root: &Path) -> Result<usize> {
         )));
     }
     let mut n = 0usize;
-    for entry in walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.map_err(|e| {
+            Error::Other(format!("walk {} for verify: {e}", root.display()))
+        })?;
         if entry.file_type().is_file() {
             n += 1;
         }

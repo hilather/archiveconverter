@@ -4,7 +4,8 @@ use crate::archive::{ArchiveFormat, EntryMeta};
 use crate::codec::FileMeta;
 use crate::error::Result;
 use crate::filter::{MemberFilter, NameTransformer};
-use crate::util::pathnorm::normalize_member_path;
+use crate::util::pathnorm::{is_safe_member_path, normalize_member_path};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -26,11 +27,29 @@ pub struct PlannedEntry {
     pub meta: FileMeta,
 }
 
+/// Counts filled after a live convert (not dry-run). Plan-time skips stay on
+/// [`ConversionPlan::skip_count`]; these are members dropped while executing.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeStats {
+    pub nested_converted: usize,
+    pub nested_skipped: usize,
+    pub passthrough_written: usize,
+    pub passthrough_skipped: usize,
+}
+
+impl RuntimeStats {
+    pub fn runtime_skipped(&self) -> usize {
+        self.nested_skipped + self.passthrough_skipped
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversionPlan {
     pub input: PathBuf,
     pub output: PathBuf,
     pub entries: Vec<PlannedEntry>,
+    /// Populated by [`crate::pipeline::run`] after a real convert.
+    pub runtime: RuntimeStats,
 }
 
 impl ConversionPlan {
@@ -108,15 +127,49 @@ pub fn build_plan(
 
     // Pre-compute renames for non-skipped members that we keep.
     let mut planned = Vec::new();
+    let mut seen_src = HashSet::new();
     for e in &file_entries {
         let src = normalize_member_path(&e.path);
+        if src.is_empty() {
+            planned.push(PlannedEntry {
+                source_path: e.path.clone(),
+                dest_path: String::new(),
+                size: e.size,
+                action: ActionKind::Skip,
+                reason: "empty member path".into(),
+                meta: e.meta.clone(),
+            });
+            continue;
+        }
+        if !is_safe_member_path(&src) {
+            planned.push(PlannedEntry {
+                source_path: src,
+                dest_path: String::new(),
+                size: e.size,
+                action: ActionKind::Skip,
+                reason: "unsafe member path".into(),
+                meta: e.meta.clone(),
+            });
+            continue;
+        }
+        if !seen_src.insert(src.clone()) {
+            planned.push(PlannedEntry {
+                source_path: src,
+                dest_path: String::new(),
+                size: e.size,
+                action: ActionKind::Skip,
+                reason: "duplicate member path in listing".into(),
+                meta: e.meta.clone(),
+            });
+            continue;
+        }
         if !opts.outer_filter.should_keep(&src) {
             planned.push(PlannedEntry {
                 source_path: src,
                 dest_path: String::new(),
                 size: e.size,
                 action: ActionKind::Skip,
-                reason: "excluded by --exclude-outer".into(),
+                reason: "excluded by outer filter".into(),
                 meta: e.meta.clone(),
             });
             continue;
@@ -165,6 +218,12 @@ pub fn build_plan(
         if dest != p.source_path {
             p.reason = format!("{}; renamed", p.reason);
         }
+        if !is_safe_member_path(&dest) {
+            p.action = ActionKind::Skip;
+            p.reason = format!("unsafe destination path after rename: {dest}");
+            p.dest_path = String::new();
+            continue;
+        }
         p.dest_path = dest;
     }
 
@@ -172,6 +231,7 @@ pub fn build_plan(
         input,
         output,
         entries: planned,
+        runtime: RuntimeStats::default(),
     })
 }
 
@@ -221,5 +281,66 @@ mod tests {
             .unwrap();
         assert_eq!(a.dest_path, "a.7z");
         assert_eq!(a.action, ActionKind::ConvertNested);
+    }
+
+    #[test]
+    fn skips_unsafe_and_duplicate_members() {
+        let entries = vec![
+            meta("../evil.7z", ArchiveFormat::SevenZ),
+            meta("ok.7z", ArchiveFormat::SevenZ),
+            meta("ok.7z", ArchiveFormat::SevenZ),
+            meta("", ArchiveFormat::Unknown),
+        ];
+        let outer = MemberFilter::new();
+        let rename = NameTransformer::new();
+        let plan = build_plan(
+            "in.7z".into(),
+            "out.7z".into(),
+            &entries,
+            PlanOptions {
+                outer_filter: &outer,
+                rename: &rename,
+                convert_nested_7z: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.nested_count(), 1);
+        assert_eq!(plan.skip_count(), 3);
+        assert!(plan
+            .entries
+            .iter()
+            .any(|e| e.reason.contains("unsafe")));
+        assert!(plan
+            .entries
+            .iter()
+            .any(|e| e.reason.contains("duplicate")));
+    }
+
+    #[test]
+    fn skips_unsafe_rename_destination() {
+        let entries = vec![
+            meta("ok.7z", ArchiveFormat::SevenZ),
+            meta("readme.txt", ArchiveFormat::Unknown),
+        ];
+        let outer = MemberFilter::new();
+        let rename = NameTransformer::from_pairs([r"readme\.txt$=../evil"]).unwrap();
+        let plan = build_plan(
+            "in.7z".into(),
+            "out.7z".into(),
+            &entries,
+            PlanOptions {
+                outer_filter: &outer,
+                rename: &rename,
+                convert_nested_7z: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.nested_count(), 1);
+        assert_eq!(plan.passthrough_count(), 0);
+        assert_eq!(plan.skip_count(), 1);
+        assert!(plan
+            .entries
+            .iter()
+            .any(|e| e.source_path == "readme.txt" && e.action == ActionKind::Skip));
     }
 }
