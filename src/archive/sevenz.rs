@@ -588,4 +588,22 @@ Size = 1
             Err(e) => eprintln!("7z not installed: {e}"),
         }
     }
+
+    #[test]
+    fn extract_rejects_unsafe_member_paths() {
+        let cli = match SevenZCli::discover() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let dummy = Path::new("missing.7z");
+        let dest = tempfile::tempdir().unwrap();
+        let err = cli
+            .extract_member(dummy, "../evil", &dest.path().join("x"))
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+        let err = cli
+            .extract_members(dummy, &["foo/../../evil"], dest.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+    }
 }

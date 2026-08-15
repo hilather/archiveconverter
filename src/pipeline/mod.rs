@@ -982,3 +982,247 @@ pub fn list_file_paths(backend: &dyn ArchiveBackend, archive: &Path) -> Result<V
 pub fn staging_path_for(dest_member: &str) -> PathBuf {
     PathBuf::from(normalize_member_path(dest_member))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::ArchiveFormat;
+    use crate::codec::OuterFormat;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    fn file_entry(path: &str) -> EntryMeta {
+        EntryMeta {
+            path: path.into(),
+            size: 8,
+            is_dir: false,
+            format_hint: ArchiveFormat::Unknown,
+            meta: Default::default(),
+        }
+    }
+
+    /// In-memory backend for pipeline skip / bulk-fallback regressions.
+    struct ScriptedBackend {
+        entries: Vec<EntryMeta>,
+        blobs: HashMap<String, Vec<u8>>,
+        fail_extract: HashSet<String>,
+        fail_bulk: bool,
+        omit_from_bulk: HashSet<String>,
+        bulk_calls: Mutex<usize>,
+        member_calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(pairs: &[(&str, &[u8])]) -> Self {
+            let mut blobs = HashMap::new();
+            let mut entries = Vec::new();
+            for (path, data) in pairs {
+                blobs.insert((*path).to_string(), data.to_vec());
+                entries.push(file_entry(path));
+            }
+            Self {
+                entries,
+                blobs,
+                fail_extract: HashSet::new(),
+                fail_bulk: false,
+                omit_from_bulk: HashSet::new(),
+                bulk_calls: Mutex::new(0),
+                member_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ArchiveBackend for ScriptedBackend {
+        fn format(&self) -> ArchiveFormat {
+            ArchiveFormat::SevenZ
+        }
+
+        fn list(&self, _archive: &Path) -> Result<Vec<EntryMeta>> {
+            Ok(self.entries.clone())
+        }
+
+        fn is_solid(&self, _archive: &Path) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn extract_member(&self, _archive: &Path, member: &str, dest_file: &Path) -> Result<()> {
+            self.member_calls
+                .lock()
+                .unwrap()
+                .push(member.to_string());
+            if self.fail_extract.contains(member) {
+                return Err(Error::Other(format!("scripted extract fail: {member}")));
+            }
+            let data = self
+                .blobs
+                .get(member)
+                .ok_or_else(|| Error::EntryNotFound(member.to_string()))?;
+            if let Some(p) = dest_file.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::write(dest_file, data)?;
+            Ok(())
+        }
+
+        fn extract_members(&self, archive: &Path, members: &[&str], dest_dir: &Path) -> Result<()> {
+            *self.bulk_calls.lock().unwrap() += 1;
+            if self.fail_bulk {
+                return Err(Error::Other("scripted bulk extract failed".into()));
+            }
+            fs::create_dir_all(dest_dir)?;
+            for m in members {
+                if self.omit_from_bulk.contains(*m) {
+                    continue;
+                }
+                let dest = dest_dir.join(m);
+                self.extract_member(archive, m, &dest)?;
+            }
+            Ok(())
+        }
+
+        fn extract_all(&self, _archive: &Path, _dest_dir: &Path) -> Result<()> {
+            Err(Error::Other("extract_all unused in scripted tests".into()))
+        }
+
+        fn pack_dir(&self, _src: &Path, _dest: &Path, _opts: &PackOptions) -> Result<()> {
+            Err(Error::Other("pack_dir unused in scripted tests".into()))
+        }
+
+        fn test(&self, _archive: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_passthrough_job(backend: &ScriptedBackend, out: &Path) -> ConversionPlan {
+        let input = out.parent().unwrap().join("dummy-input.7z");
+        fs::write(&input, b"not-a-real-archive").unwrap();
+        let mut opts = PipelineOptions::new(input, out.to_path_buf());
+        opts.outer_format = OuterFormat::Dir;
+        opts.verify = false;
+        opts.solid_single_pass = true;
+        opts.nested_concurrency = 1;
+        opts.temp_dir = Some(out.parent().unwrap().join("tmp"));
+        run(backend, &opts).expect("pipeline should succeed")
+    }
+
+    #[test]
+    fn find_extracted_prefers_exact_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("nested/foo.7z");
+        let b = dir.path().join("other/foo.7z");
+        fs::create_dir_all(a.parent().unwrap()).unwrap();
+        fs::create_dir_all(b.parent().unwrap()).unwrap();
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let got = find_extracted(dir.path(), "nested/foo.7z").unwrap();
+        assert_eq!(got, a);
+    }
+
+    #[test]
+    fn find_extracted_unique_basename_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("other/bar.7z");
+        fs::create_dir_all(only.parent().unwrap()).unwrap();
+        fs::write(&only, b"x").unwrap();
+        let got = find_extracted(dir.path(), "wanted/bar.7z").unwrap();
+        assert_eq!(got, only);
+    }
+
+    #[test]
+    fn find_extracted_ambiguous_basename_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["a/foo.7z", "b/foo.7z"] {
+            let p = dir.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"x").unwrap();
+        }
+        let err = find_extracted(dir.path(), "missing/foo.7z").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn find_extracted_rejects_unsafe_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = find_extracted(dir.path(), "../evil").unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+    }
+
+    #[test]
+    fn passthrough_extract_failure_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[
+            ("keep.txt", b"keep"),
+            ("drop.txt", b"drop"),
+            ("also.txt", b"also"),
+        ]);
+        backend.fail_extract.insert("drop.txt".into());
+        backend.fail_bulk = true;
+        let out = dir.path().join("out");
+        let plan = run_passthrough_job(&backend, &out);
+        assert_eq!(plan.runtime.passthrough_written, 2);
+        assert_eq!(plan.runtime.passthrough_skipped, 1);
+        assert!(out.join("keep.txt").is_file());
+        assert!(out.join("also.txt").is_file());
+        assert!(!out.join("drop.txt").exists());
+        assert_eq!(*backend.bulk_calls.lock().unwrap(), 1);
+        assert!(
+            backend
+                .member_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m == "drop.txt")
+        );
+    }
+
+    #[test]
+    fn bulk_extract_failure_falls_back_to_per_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[("a.txt", b"aaa"), ("b.txt", b"bbb")]);
+        backend.fail_bulk = true;
+        let out = dir.path().join("out");
+        let plan = run_passthrough_job(&backend, &out);
+        assert_eq!(plan.runtime.passthrough_written, 2);
+        assert_eq!(plan.runtime.passthrough_skipped, 0);
+        assert_eq!(*backend.bulk_calls.lock().unwrap(), 1);
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"aaa");
+        assert_eq!(fs::read(out.join("b.txt")).unwrap(), b"bbb");
+    }
+
+    #[test]
+    fn missing_bulk_member_is_skipped_others_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[("a.txt", b"aaa"), ("ghost.txt", b"g")]);
+        backend.omit_from_bulk.insert("ghost.txt".into());
+        let out = dir.path().join("out");
+        let plan = run_passthrough_job(&backend, &out);
+        assert_eq!(plan.runtime.passthrough_written, 1);
+        assert_eq!(plan.runtime.passthrough_skipped, 1);
+        assert!(out.join("a.txt").is_file());
+        assert!(!out.join("ghost.txt").exists());
+    }
+
+    #[test]
+    fn all_passthrough_failures_error_with_nothing_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[("a.txt", b"a"), ("b.txt", b"b")]);
+        backend.fail_extract.insert("a.txt".into());
+        backend.fail_extract.insert("b.txt".into());
+        backend.fail_bulk = true;
+        let input = dir.path().join("in.7z");
+        fs::write(&input, b"x").unwrap();
+        let out = dir.path().join("out");
+        let mut opts = PipelineOptions::new(input, out);
+        opts.outer_format = OuterFormat::Dir;
+        opts.temp_dir = Some(dir.path().join("tmp"));
+        let err = run(&backend, &opts).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to write"),
+            "{err}"
+        );
+    }
+}

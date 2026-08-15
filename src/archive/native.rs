@@ -849,6 +849,21 @@ mod tests {
     }
 
     #[test]
+    fn extract_rejects_unsafe_member_paths() {
+        let backend = NativeSevenZ::new();
+        let dummy = Path::new("missing.7z");
+        let dest = tempfile::tempdir().unwrap();
+        let err = backend
+            .extract_member(dummy, "../evil", &dest.path().join("x"))
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+        let err = backend
+            .extract_members(dummy, &["/abs/path"], dest.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+    }
+
+    #[test]
     fn native_roundtrip_nonsolid() {
         let dir = tempfile::tempdir().unwrap();
         let tree = dir.path().join("t");

@@ -230,6 +230,10 @@ fn corrupt_nested_is_skipped_others_succeed() {
     // Must succeed overall despite corrupt nest.
     let plan = pipeline::run(&backend(), &opts).expect("convert should succeed with skip");
     assert_eq!(plan.nested_count(), 2, "plan still lists both nests");
+    assert_eq!(plan.runtime.nested_converted, 1);
+    assert_eq!(plan.runtime.nested_skipped, 1);
+    assert_eq!(plan.runtime.passthrough_written, 1);
+    assert_eq!(plan.runtime.passthrough_skipped, 0);
 
     let paths = list_file_paths(&backend(), &out).unwrap();
     assert!(
@@ -336,5 +340,28 @@ fn rsync_filter_files_outer_and_inner() {
     assert!(
         inner_paths.iter().any(|p| p.ends_with("hello.txt")),
         "{inner_paths:?}"
+    );
+}
+
+/// Only corrupt nested members → job fails (nothing usable to write).
+#[test]
+fn all_nests_corrupt_and_no_passthrough_fails() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let stage = root.path().join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("a.7z"), b"not a 7z").unwrap();
+    fs::write(stage.join("b.7z"), b"also not a 7z").unwrap();
+    let outer = root.path().join("outer.7z");
+    pack_solid(&stage, &outer);
+
+    let out = root.path().join("converted.7z");
+    let mut opts = PipelineOptions::new(outer, out);
+    opts.pack = default_pack();
+    opts.temp_dir = Some(root.path().join("tmp"));
+    let err = pipeline::run(&backend(), &opts).unwrap_err();
+    assert!(
+        err.to_string().contains("nothing to write"),
+        "{err}"
     );
 }

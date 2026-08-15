@@ -219,3 +219,62 @@ fn convert_rsync_filter_from_cli() {
     assert!(out.is_file());
     assert_archive_ok(&out);
 }
+
+#[test]
+fn convert_rsync_filter_equals_minus_form() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let outer = make_nested_outer(root.path());
+    let out = root.path().join("out.7z");
+
+    bin()
+        .args([
+            "convert",
+            outer.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--filter-outer=exclude skip_me.7z",
+            "--filter-inner=- *.tmp",
+            "--rename",
+            r"_old\.7z$=.7z",
+            "--verify",
+            "--level",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote"));
+
+    assert!(out.is_file());
+}
+
+#[test]
+fn convert_single_rsync_filter_cli() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let solid = make_inner_solid(root.path(), "s.7z");
+    let out = root.path().join("o.7z");
+    let rules = root.path().join("ex");
+    fs::write(&rules, "__MACOSX/\n").unwrap();
+
+    bin()
+        .args([
+            "convert-single",
+            solid.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--filter=exclude *.tmp",
+            "--exclude-from",
+            rules.to_str().unwrap(),
+            "--verify",
+            "--level",
+            "1",
+        ])
+        .assert()
+        .success();
+
+    assert!(out.is_file());
+    let paths = list_paths(&out);
+    assert!(!paths.iter().any(|p| p.ends_with(".tmp")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("__MACOSX")), "{paths:?}");
+}

@@ -535,4 +535,47 @@ mod tests {
         f.add_filter_line("- *").unwrap();
         assert!(f.try_7z_exclude_globs().is_none());
     }
+
+    #[test]
+    fn include_from_then_exclude_star() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc");
+        fs::write(&inc, "*.txt\n*.7z\n").unwrap();
+        let mut f = MemberFilter::new();
+        f.add_include_from(&inc).unwrap();
+        f.add_filter_line("- *").unwrap();
+        assert!(f.should_keep("a.txt"));
+        assert!(f.should_keep("b.7z"));
+        assert!(!f.should_keep("a.bin"));
+        // rsync walk: `- *` excludes parent dirs unless `+ */` is present.
+        assert!(!f.should_keep("nested/b.7z"));
+
+        let mut f2 = MemberFilter::new();
+        f2.add_include_from(&inc).unwrap();
+        f2.add_filter_line("+ */").unwrap();
+        f2.add_filter_line("- *").unwrap();
+        assert!(f2.should_keep("nested/b.7z"));
+        assert!(!f2.should_keep("nested/a.bin"));
+    }
+
+    #[test]
+    fn from_cli_order_filter_then_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let ff = dir.path().join("f");
+        fs::write(&ff, "+ keep.me\n").unwrap();
+        let f = MemberFilter::from_cli(
+            &[ff],
+            &["exclude drop.me".into()],
+            &[],
+            &[],
+            &[],
+            &[r"regex_drop".into()],
+            false,
+        )
+        .unwrap();
+        assert!(f.should_keep("keep.me"));
+        assert!(!f.should_keep("drop.me"));
+        assert!(!f.should_keep("regex_drop.txt"));
+        assert!(f.should_keep("other.txt"));
+    }
 }
