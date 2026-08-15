@@ -2,7 +2,7 @@
 name = "archiveconverter"
 version = "0.1.0"
 edition = "2021"
-description = "Convert nested solid 7z archives to non-solid form with filtering and renaming"
+description = "Convert nested solid 7z archives to non-solid form (outer 7z / tar / dir), with rsync/regex filters, renames, and size-aware concurrent nest conversion"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/hilather/archiveconverter"

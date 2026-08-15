@@ -40,7 +40,7 @@ pub enum NativePipeline {
     },
     /// Phase 3: solid-order decode → windowed **parallel LZMA2** → stream packs to disk.
     ///
-    /// In-flight window ≈ encode thread count (one big file = that file only — yolo).
+    /// In-flight window ≈ encode thread count; a single huge file is always admitted alone.
     /// Packs are appended as they finish; header written at the end.
     #[default]
     ParallelCodec,

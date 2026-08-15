@@ -27,9 +27,9 @@ Published timings: [`docs/bench/RESULTS.md`](bench/RESULTS.md).
 | 17 | Outer append-store (mutex) | **Done** | Nested converts finish → append Copy packs; no final outer recompress |
 | 18 | Single-nest pack threads=1 | **Done** | MT LZMA often slower on dense tiny-file nests |
 | 19 | Skip corrupt nested | **Done** | Log + continue; missing from output |
-| 21 | Skip unexpected members | **Done** | Passthrough extract/type failures, unsafe/duplicate paths; bulk extract falls back per-member |
-| 22 | Rsync filter files/rules | **Done** | First-match, dir prune, `--filter-from` / `--exclude-from`; simple excludes still map to `7z -x!` |
-| 20 | Manual bench baselines | **Done** | `bench_nested baseline-manual` stores one-at-a-time 7z times at matching `-mmt` |
+| 20 | Skip unexpected members | **Done** | Passthrough extract/type failures, unsafe/duplicate paths; bulk extract falls back per-member |
+| 21 | Rsync filter files/rules | **Done** | First-match, dir prune, `--filter-from` / `--exclude-from`; simple excludes still map to `7z -x!` |
+| 22 | Manual bench baselines | **Done** | `bench_nested baseline-manual` stores one-at-a-time 7z times at matching `-mmt` |
 
 ## CLI knobs
 
@@ -97,7 +97,7 @@ cargo test --release --test native_backend -- --nocapture
 | **ParallelCodec pipeline** | Default for native: solid-order decode → windowed **rayon** LZMA2 → stream packs |
 | **Codec trait** | `pure-rust` (`lzma-rust2`) or `liblzma` (system raw LZMA2 via `lzma-sys`) |
 | **Streaming packer** | `NonsolidLzma2Writer`: append each compressed pack as it finishes; header at end |
-| **Peak memory** | ≈ **in-flight window** (encode thread count) of uncompressed files + small reorder of compressed packs — **not** the whole archive. One huge file = that file (yolo). |
+| **Peak memory** | ≈ **in-flight window** (encode thread count) of uncompressed files + small reorder of compressed packs — **not** the whole archive. |
 
 ```bash
 # Phase 3 (defaults when --backend native): windowed parallel + liblzma
@@ -172,3 +172,7 @@ Workers never share a bare file handle for archive formats; only one thread appe
 
 - Map more regex exclude patterns to 7z globs.
 - Publish full-scale **manual** baselines alongside tool matrix (store via `baseline-manual`, large wall time).
+
+### Design note
+
+Rsync wildcard excludes (`*.tmp`) are intentionally **not** mapped to `7z -x!` globs: 7z `*` does not reliably cross `/`, and a partial map would skip the post-filter pass. Only literal prefixes and exact names take the fast path.

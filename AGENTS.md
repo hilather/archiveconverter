@@ -1,8 +1,10 @@
 # Agent instructions — archiveconverter
 
-You are working in **archiveconverter**, a Rust tool that converts nested solid 7z archives to non-solid form (outer 7z / tar / dir), with size-aware nest concurrency and optional native Phase 3 codecs.
+> **Contributors: this file is for automated coding agents.** Human-readable docs live in [`README.md`](README.md) and [`docs/`](docs/).
 
-This file is **mandatory policy** for every coding agent session in this repo (Grok, Claude, Codex, Cursor, etc.).
+You are working in **archiveconverter**, a Rust tool that converts nested solid 7z archives to non-solid form (outer 7z / tar / dir), with size-aware nest concurrency and optional native codecs.
+
+This file is **mandatory policy** for every coding agent session in this repo (Grok, Claude, Codex, Cursor, etc.). It is not user-facing documentation.
 
 ---
 

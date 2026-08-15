@@ -58,7 +58,7 @@ pub fn parse_byte_size(s: &str) -> Result<u64> {
 /// Whether a job of `job_size` may start given current in-flight state.
 ///
 /// - Never exceeds `max_workers`.
-/// - If nothing is running, always admit (single oversized nest is yolo).
+/// - If nothing is running, always admit (a single oversized nest runs alone).
 /// - If `budget == 0`, size is unlimited (workers only).
 /// - Else require `running_sum + job_size <= budget`.
 pub fn can_admit_nested(
