@@ -529,16 +529,8 @@ pub fn rsync_exclude_to_7z_globs(pattern: &str) -> Option<Vec<String>> {
         }
         return Some(vec![prefix.to_string(), format!("{prefix}/*")]);
     }
-    // `*.ext` (basename glob) — 7z `*` also matches `/`.
-    if let Some(ext) = p.strip_prefix("*.") {
-        if !ext.is_empty()
-            && ext
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Some(vec![format!("*.{ext}")]);
-        }
-    }
+    // Basename wildcards (`*.tmp`) are *not* mapped: 7z `*` does not
+    // reliably cross `/`, and a partial `-x!` map would skip post-filter.
     // Directory prefix: `dir/` or `/dir/`
     let dir = p.trim_start_matches('/').trim_end_matches('/');
     if p.ends_with('/')
@@ -710,10 +702,10 @@ mod tests {
 
     #[test]
     fn maps_simple_excludes_to_7z() {
-        assert!(rsync_exclude_to_7z_globs("*.tmp")
-            .unwrap()
-            .iter()
-            .any(|g| g == "*.tmp"));
+        assert!(
+            rsync_exclude_to_7z_globs("*.tmp").is_none(),
+            "wildcards must post-filter so nested paths match"
+        );
         assert!(rsync_exclude_to_7z_globs("__MACOSX/")
             .unwrap()
             .iter()

@@ -112,11 +112,14 @@ pub struct ConvertArgs {
     #[arg(long = "include-outer")]
     pub include_outer: Vec<String>,
 
-    /// Rsync filter rule for nested members (`+ pat`, `- pat`, or bare exclude).
+    /// Rsync filter rule for nested members (`+ pat`, `exclude pat`, or bare
+    /// exclude). A leading `-` must use `--filter-inner='- *.tmp'` so clap
+    /// does not treat it as a flag.
     #[arg(long = "filter-inner")]
     pub filter_inner: Vec<String>,
 
-    /// Rsync filter rule for outer members (`+ pat`, `- pat`, or bare exclude).
+    /// Rsync filter rule for outer members (`+ pat`, `exclude pat`, or bare
+    /// exclude). Use `--filter-outer='- pat'` if the rule starts with `-`.
     #[arg(long = "filter-outer")]
     pub filter_outer: Vec<String>,
 
@@ -229,7 +232,8 @@ pub struct ConvertSingleArgs {
     /// Regex include (repeatable; first-match with `--exclude`).
     #[arg(long = "include")]
     pub include: Vec<String>,
-    /// Rsync filter rule (`+ pat`, `- pat`, or bare exclude).
+    /// Rsync filter rule (`+ pat`, `exclude pat`, or bare exclude).
+    /// A leading `-` must use `--filter='- *.tmp'`.
     #[arg(long = "filter")]
     pub filter: Vec<String>,
     /// Rsync filter file.

@@ -100,8 +100,8 @@ archiveconverter convert outer.7z -o out.7z \
 # Same filters as rsync files/rules (first-match; dir prune)
 archiveconverter convert outer.7z -o out.7z \
   --exclude-from-outer skip.excludes \
-  --filter-inner '- *.tmp' \
-  --filter-inner '- __MACOSX/'
+  --filter-inner 'exclude *.tmp' \
+  --filter-inner 'exclude __MACOSX/'
 
 # Outer as uncompressed tar
 archiveconverter convert outer.7z -o out.tar --outer-format tar --level 1 --verify
@@ -143,7 +143,7 @@ archiveconverter convert-single solid.7z -o out.7z \
 | `--outer-format` | inferred | `7z` \| `tar` \| `dir`. Omit: `.tar` → tar; path ends with `/` → dir; else 7z |
 | `--exclude-inner` / `--exclude-outer` | — | Regex exclude (repeatable); appended after rsync rules |
 | `--include-inner` / `--include-outer` | — | Regex include (repeatable); first-match with excludes |
-| `--filter-inner` / `--filter-outer` | — | Rsync rule: `+ pat`, `- pat`, or bare exclude |
+| `--filter-inner` / `--filter-outer` | — | Rsync rule: `+ pat`, `exclude pat`, or bare exclude. A leading `-` needs `--filter-inner='- *.tmp'` |
 | `--filter-from-inner` / `--filter-from-outer` | — | Rsync filter file (`#` comments, `merge`, `clear`) |
 | `--include-from-*` / `--exclude-from-*` | — | Rsync include-from / exclude-from (one pattern per line) |
 | `--rename` | — | `PATTERN=REPL` on outer names (ordered; `$1` / `$name`) |
