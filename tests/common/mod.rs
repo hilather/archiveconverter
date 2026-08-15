@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub fn backend() -> SevenZCli {
     SevenZCli::discover().expect("7z/7zz must be installed for integration tests")
@@ -18,6 +19,34 @@ pub fn ensure_7z() {
     CHECKED.get_or_init(|| {
         find_7z_binary().expect("7z/7zz must be on PATH (or ~/.local/bin) for tests");
     });
+}
+
+/// Set a file's modification time to `unix_secs` (UTC).
+///
+/// Uses `std` so this works on both GNU/Linux and macOS. Do **not** call
+/// `touch -d @epoch` — BSD `touch` (macOS CI) rejects that syntax.
+pub fn set_mtime(path: &Path, unix_secs: u64) {
+    let want = UNIX_EPOCH + Duration::from_secs(unix_secs);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("open {} to set mtime: {e}", path.display()));
+    file.set_modified(want).unwrap_or_else(|e| {
+        panic!(
+            "set_modified {} to {unix_secs}: {e}",
+            path.display()
+        )
+    });
+    let got = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("read mtime {}: {e}", path.display()));
+    let got_secs = got.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    // Some FS round to 1s; we set whole seconds so this should match exactly.
+    assert_eq!(
+        got_secs, unix_secs,
+        "mtime did not stick on {} (got {got_secs})",
+        path.display()
+    );
 }
 
 /// Write a text file under `dir` with nested relative path.

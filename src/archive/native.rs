@@ -628,6 +628,11 @@ impl ArchiveBackend for NativeSevenZ {
     }
 
     fn extract_member(&self, archive: &Path, member: &str, dest_file: &Path) -> Result<()> {
+        if !is_safe_member_path(member) {
+            return Err(Error::Other(format!(
+                "refusing to extract unsafe member path: {member}"
+            )));
+        }
         if let Some(parent) = dest_file.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -643,6 +648,13 @@ impl ArchiveBackend for NativeSevenZ {
         if members.is_empty() {
             return Ok(());
         }
+        for m in members {
+            if !is_safe_member_path(m) {
+                return Err(Error::Other(format!(
+                    "refusing to extract unsafe member path: {m}"
+                )));
+            }
+        }
         fs::create_dir_all(dest_dir)?;
         let want: std::collections::HashSet<String> =
             members.iter().map(|m| normalize_member_path(m)).collect();
@@ -653,6 +665,10 @@ impl ArchiveBackend for NativeSevenZ {
                     return Ok(true);
                 }
                 let path = normalize_member_path(entry.name());
+                if !is_safe_member_path(&path) {
+                    io::copy(r, &mut io::sink()).map_err(sevenz_rust2::Error::from)?;
+                    return Ok(true);
+                }
                 if want.contains(&path) {
                     let dest = dest_dir.join(&path);
                     if let Some(p) = dest.parent() {
@@ -830,6 +846,21 @@ mod tests {
         let want = normalize_member_path(member);
         let mut reader = backend.open_reader(archive).unwrap();
         reader.read_file(&want).map_err(map_err).unwrap()
+    }
+
+    #[test]
+    fn extract_rejects_unsafe_member_paths() {
+        let backend = NativeSevenZ::new();
+        let dummy = Path::new("missing.7z");
+        let dest = tempfile::tempdir().unwrap();
+        let err = backend
+            .extract_member(dummy, "../evil", &dest.path().join("x"))
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+        let err = backend
+            .extract_members(dummy, &["/abs/path"], dest.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
     }
 
     #[test]

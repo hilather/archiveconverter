@@ -52,6 +52,8 @@ jobs:
       - name: Check
         run: cargo check --all-targets
 
+      # GNU (Ubuntu) and BSD (macOS) userland differ. Do not use `touch -d @epoch`
+      # or `date -d` in tests; use tests/common::set_mtime (std::fs).
       - name: Test
         run: cargo test --all-targets -- --nocapture
 

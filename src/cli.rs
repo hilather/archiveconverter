@@ -93,13 +93,59 @@ pub struct ConvertArgs {
     #[arg(long = "outer-format", value_enum)]
     pub outer_format: Option<CliOuterFormat>,
 
-    /// Regex to exclude members inside nested archives (repeatable)
+    /// Regex to exclude members inside nested archives (repeatable).
+    /// Appended after rsync `--filter-inner` / `--filter-from-inner` rules.
     #[arg(long = "exclude-inner")]
     pub exclude_inner: Vec<String>,
 
-    /// Regex to exclude members of the outer archive (repeatable)
+    /// Regex to exclude members of the outer archive (repeatable).
+    /// Appended after rsync `--filter-outer` / `--filter-from-outer` rules.
     #[arg(long = "exclude-outer")]
     pub exclude_outer: Vec<String>,
+
+    /// Regex include for nested members (repeatable; first-match with excludes).
+    /// An include-only list does not drop other files (rsync default).
+    #[arg(long = "include-inner")]
+    pub include_inner: Vec<String>,
+
+    /// Regex include for outer members (repeatable; first-match with excludes).
+    #[arg(long = "include-outer")]
+    pub include_outer: Vec<String>,
+
+    /// Rsync filter rule for nested members (`+ pat`, `exclude pat`, or bare
+    /// exclude). A leading `-` must use `--filter-inner='- *.tmp'` so clap
+    /// does not treat it as a flag.
+    #[arg(long = "filter-inner")]
+    pub filter_inner: Vec<String>,
+
+    /// Rsync filter rule for outer members (`+ pat`, `exclude pat`, or bare
+    /// exclude). Use `--filter-outer='- pat'` if the rule starts with `-`.
+    #[arg(long = "filter-outer")]
+    pub filter_outer: Vec<String>,
+
+    /// Rsync filter file for nested members (`--filter-from`).
+    #[arg(long = "filter-from-inner")]
+    pub filter_from_inner: Vec<PathBuf>,
+
+    /// Rsync filter file for outer members.
+    #[arg(long = "filter-from-outer")]
+    pub filter_from_outer: Vec<PathBuf>,
+
+    /// Rsync `--include-from` file for nested members (one include pattern per line).
+    #[arg(long = "include-from-inner")]
+    pub include_from_inner: Vec<PathBuf>,
+
+    /// Rsync `--include-from` file for outer members.
+    #[arg(long = "include-from-outer")]
+    pub include_from_outer: Vec<PathBuf>,
+
+    /// Rsync `--exclude-from` file for nested members (one exclude pattern per line).
+    #[arg(long = "exclude-from-inner")]
+    pub exclude_from_inner: Vec<PathBuf>,
+
+    /// Rsync `--exclude-from` file for outer members.
+    #[arg(long = "exclude-from-outer")]
+    pub exclude_from_outer: Vec<PathBuf>,
 
     /// Rename rule PATTERN=REPLACEMENT for outer member names (repeatable)
     #[arg(long = "rename")]
@@ -180,8 +226,25 @@ pub struct ConvertSingleArgs {
     pub input: PathBuf,
     #[arg(short = 'o', long)]
     pub output: PathBuf,
+    /// Regex exclude (repeatable; appended after rsync filter rules).
     #[arg(long = "exclude")]
     pub exclude: Vec<String>,
+    /// Regex include (repeatable; first-match with `--exclude`).
+    #[arg(long = "include")]
+    pub include: Vec<String>,
+    /// Rsync filter rule (`+ pat`, `exclude pat`, or bare exclude).
+    /// A leading `-` must use `--filter='- *.tmp'`.
+    #[arg(long = "filter")]
+    pub filter: Vec<String>,
+    /// Rsync filter file.
+    #[arg(long = "filter-from")]
+    pub filter_from: Vec<PathBuf>,
+    /// Rsync include-from file (one include pattern per line).
+    #[arg(long = "include-from")]
+    pub include_from: Vec<PathBuf>,
+    /// Rsync exclude-from file (one exclude pattern per line).
+    #[arg(long = "exclude-from")]
+    pub exclude_from: Vec<PathBuf>,
     #[arg(long)]
     pub temp_dir: Option<PathBuf>,
     #[arg(long)]
@@ -286,12 +349,24 @@ impl ConvertArgs {
     }
 
     pub fn to_pipeline_options(&self) -> Result<PipelineOptions> {
-        let mut exclude_inner = MemberFilter::with_excludes(&self.exclude_inner)?;
-        let mut exclude_outer = MemberFilter::with_excludes(&self.exclude_outer)?;
-        if self.basename_match {
-            exclude_inner = exclude_inner.basename_only(true);
-            exclude_outer = exclude_outer.basename_only(true);
-        }
+        let exclude_inner = MemberFilter::from_cli(
+            &self.filter_from_inner,
+            &self.filter_inner,
+            &self.include_from_inner,
+            &self.exclude_from_inner,
+            &self.include_inner,
+            &self.exclude_inner,
+            self.basename_match,
+        )?;
+        let exclude_outer = MemberFilter::from_cli(
+            &self.filter_from_outer,
+            &self.filter_outer,
+            &self.include_from_outer,
+            &self.exclude_from_outer,
+            &self.include_outer,
+            &self.exclude_outer,
+            self.basename_match,
+        )?;
         let rename = NameTransformer::from_pairs(&self.rename)?;
         if self.level > 9 {
             return Err(Error::Other("--level must be 0-9".into()));
@@ -337,6 +412,18 @@ impl ConvertArgs {
 }
 
 impl ConvertSingleArgs {
+    pub fn member_filter(&self) -> Result<MemberFilter> {
+        MemberFilter::from_cli(
+            &self.filter_from,
+            &self.filter,
+            &self.include_from,
+            &self.exclude_from,
+            &self.include,
+            &self.exclude,
+            false,
+        )
+    }
+
     pub fn backend_kind(&self) -> BackendKind {
         self.backend.into()
     }

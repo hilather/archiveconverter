@@ -3,7 +3,6 @@ use archiveconverter::archive::{open_backend_with, PackOptions};
 use archiveconverter::cli::{Cli, Commands};
 use archiveconverter::convert::ConverterRegistry;
 use archiveconverter::error::Result;
-use archiveconverter::filter::MemberFilter;
 use archiveconverter::pipeline::{self, convert_single_ex};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -18,7 +17,9 @@ fn main() {
 fn exit_code(e: &archiveconverter::Error) -> i32 {
     match e {
         archiveconverter::Error::BackendMissing(_) => 2,
-        archiveconverter::Error::InvalidRegex { .. } => 2,
+        archiveconverter::Error::InvalidRegex { .. }
+        | archiveconverter::Error::InvalidFilter { .. }
+        | archiveconverter::Error::FilterFileNotFound(_) => 2,
         archiveconverter::Error::NameCollision(_) => 2,
         _ => 1,
     }
@@ -60,13 +61,14 @@ fn try_main() -> Result<()> {
             tracing::info!(backend = args.backend_kind().as_str(), "using archive backend");
             let plan = pipeline::run(backend.as_ref(), &opts)?;
             if !opts.dry_run {
+                let skipped = plan.skip_count() + plan.runtime.runtime_skipped();
                 println!(
                     "Wrote {} (outer={}, nested={}, passthrough={}, skipped={}, backend={})",
                     opts.output.display(),
                     opts.outer_format.as_str(),
-                    plan.nested_count(),
-                    plan.passthrough_count(),
-                    plan.skip_count(),
+                    plan.runtime.nested_converted,
+                    plan.runtime.passthrough_written,
+                    skipped,
                     args.backend_kind().as_str(),
                 );
             }
@@ -75,7 +77,7 @@ fn try_main() -> Result<()> {
         Commands::ConvertSingle(args) => {
             let backend =
                 open_backend_with(args.backend_kind(), args.native_options()?)?;
-            let exclude = MemberFilter::with_excludes(&args.exclude)?;
+            let exclude = args.member_filter()?;
             let pack = PackOptions {
                 non_solid: true,
                 threads: args.threads,

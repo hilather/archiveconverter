@@ -84,7 +84,7 @@ Verify docs still say:
 - `--nested-size-budget` default **500M**  
 - **Single nest** → pack threads **1**  
 - **Dir** default path = input **stem** beside input  
-- Corrupt nested → **skip**, continue  
+- Corrupt / unexpected members → **skip**, continue  
 - Manual baseline = one nest at a time; tool may concurrent multi-nest  
 
 ### 5. Commit hygiene

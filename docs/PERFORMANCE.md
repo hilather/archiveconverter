@@ -27,6 +27,8 @@ Published timings: [`docs/bench/RESULTS.md`](bench/RESULTS.md).
 | 17 | Outer append-store (mutex) | **Done** | Nested converts finish → append Copy packs; no final outer recompress |
 | 18 | Single-nest pack threads=1 | **Done** | MT LZMA often slower on dense tiny-file nests |
 | 19 | Skip corrupt nested | **Done** | Log + continue; missing from output |
+| 21 | Skip unexpected members | **Done** | Passthrough extract/type failures, unsafe/duplicate paths; bulk extract falls back per-member |
+| 22 | Rsync filter files/rules | **Done** | First-match, dir prune, `--filter-from` / `--exclude-from`; simple excludes still map to `7z -x!` |
 | 20 | Manual bench baselines | **Done** | `bench_nested baseline-manual` stores one-at-a-time 7z times at matching `-mmt` |
 
 ## CLI knobs

@@ -17,6 +17,12 @@ pub enum Error {
         source: regex::Error,
     },
 
+    #[error("invalid filter rule '{rule}': {message}")]
+    InvalidFilter { rule: String, message: String },
+
+    #[error("filter file not found: {0}")]
+    FilterFileNotFound(std::path::PathBuf),
+
     #[error("name collision: multiple members map to '{0}'")]
     NameCollision(String),
 

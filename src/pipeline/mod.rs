@@ -4,7 +4,7 @@ pub mod context;
 pub mod plan;
 
 pub use context::PipelineOptions;
-pub use plan::{build_plan, ActionKind, ConversionPlan, PlanOptions};
+pub use plan::{build_plan, ActionKind, ConversionPlan, PlanOptions, RuntimeStats};
 
 use crate::archive::native::NativeSevenZ;
 use crate::archive::{ArchiveBackend, EntryMeta, PackOptions};
@@ -77,11 +77,17 @@ pub fn run(backend: &dyn ArchiveBackend, opts: &PipelineOptions) -> Result<Conve
         return Ok(plan);
     }
 
-    execute(backend, opts, &plan)?;
+    let runtime = execute(backend, opts, &plan)?;
+    let mut plan = plan;
+    plan.runtime = runtime;
     Ok(plan)
 }
 
-fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &ConversionPlan) -> Result<()> {
+fn execute(
+    backend: &dyn ArchiveBackend,
+    opts: &PipelineOptions,
+    plan: &ConversionPlan,
+) -> Result<RuntimeStats> {
     let start = Instant::now();
     let job = JobTemp::create(opts.temp_dir.as_deref(), opts.keep_temp)?;
 
@@ -111,6 +117,7 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
     let use_solid_pass = want_bulk && (solid || max_workers > 1);
 
     let outer_pass = job.child("outer-solid-pass");
+    let mut use_solid_pass = use_solid_pass;
     if use_solid_pass {
         let t = Instant::now();
         tracing::info!(
@@ -120,8 +127,20 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
             size_budget,
             "bulk extract of needed outer members (single-pass / pre-stage for concurrency)"
         );
-        backend.extract_members(&opts.input, &needed, &outer_pass)?;
-        log_stage(opts, "outer_bulk_extract", t.elapsed());
+        match backend.extract_members(&opts.input, &needed, &outer_pass) {
+            Ok(()) => log_stage(opts, "outer_bulk_extract", t.elapsed()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "bulk extract failed; falling back to per-member extract so remaining members can still be written"
+                );
+                eprintln!(
+                    "warning: bulk extract failed ({e}); falling back to per-member extract"
+                );
+                use_solid_pass = false;
+                remove_dir_all_quiet(&outer_pass);
+            }
+        }
     }
 
     // Streaming outer: append finished members as they complete (mutex-serialized).
@@ -144,39 +163,32 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
     );
 
     // Passthrough files first (cheap) — stream into outer under the same mutex.
+    // Unexpected types / extract failures are skipped so the rest of the archive
+    // can still be written (same policy as corrupt nested converts).
     let pass_tmp = job.child("passthrough-tmp");
     fs::create_dir_all(&pass_tmp)?;
-    for entry in &plan.entries {
+    let mut passthrough_written = 0usize;
+    let mut passthrough_skipped = 0usize;
+    for (pass_i, entry) in plan.entries.iter().enumerate() {
         if entry.action != ActionKind::Passthrough {
             continue;
         }
-        if !is_safe_member_path(&entry.dest_path) {
-            return Err(Error::Other(format!(
-                "unsafe destination path: {}",
-                entry.dest_path
-            )));
-        }
-        // Unique temp name per member (flattened path)
-        let tmp = pass_tmp.join(entry.dest_path.replace('/', "__"));
-        if use_solid_pass {
-            let src = find_extracted(&outer_pass, &entry.source_path)?;
-            if let Some(parent) = tmp.parent() {
-                fs::create_dir_all(parent)?;
+        match stage_passthrough(
+            backend,
+            opts,
+            entry,
+            pass_i,
+            &pass_tmp,
+            use_solid_pass,
+            &outer_pass,
+            &outer,
+        ) {
+            Ok(()) => passthrough_written += 1,
+            Err(e) => {
+                log_member_skip("passthrough member", &entry.source_path, &e.to_string());
+                passthrough_skipped += 1;
             }
-            fs::copy(&src, &tmp)?;
-            let _ = fs::remove_file(&src);
-        } else {
-            if let Some(parent) = tmp.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            backend.extract_member(&opts.input, &entry.source_path, &tmp)?;
         }
-        // Prefer source outer listing meta; fill gaps from extracted FS times (CLI extract).
-        let mut meta = entry.meta.clone();
-        meta.merge_missing(&FileMeta::from_fs_path(&tmp));
-        outer.push_path_with_meta(entry.dest_path.clone(), &tmp, Some(meta))?;
-        let _ = fs::remove_file(&tmp);
-        tracing::info!(path = %entry.source_path, dest = %entry.dest_path, "passthrough outer member (appended)");
     }
     remove_dir_all_quiet(&pass_tmp);
 
@@ -233,7 +245,7 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
 
     if outer.is_empty()? {
         return Err(Error::Other(format!(
-            "nothing to write: all {} nested archive(s) failed and there are no passthrough members",
+            "nothing to write: all {} nested archive(s) failed and there are no usable passthrough members",
             nested.len()
         )));
     }
@@ -251,7 +263,7 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
 
     if opts.verify {
         tracing::info!(format = outer_format.as_str(), "verifying output");
-        let expected = plan.passthrough_count() + nested_converted;
+        let expected = passthrough_written + nested_converted;
         let files = match outer_format {
             OuterFormat::SevenZ => {
                 backend.test(&out_tmp)?;
@@ -283,9 +295,16 @@ fn execute(backend: &dyn ArchiveBackend, opts: &PipelineOptions, plan: &Conversi
         nested_size_budget = size_budget,
         nested_converted,
         nested_skipped,
+        passthrough_written,
+        passthrough_skipped,
         "conversion complete"
     );
-    Ok(())
+    Ok(RuntimeStats {
+        nested_converted,
+        nested_skipped,
+        passthrough_written,
+        passthrough_skipped,
+    })
 }
 
 /// Outcome of nested converts: successful members + soft-failed (corrupt/unreadable).
@@ -295,15 +314,70 @@ struct NestedRunStats {
 }
 
 fn log_nested_skip(source_path: &str, err: &str) {
+    log_member_skip("nested archive", source_path, err);
+}
+
+fn log_member_skip(kind: &str, source_path: &str, err: &str) {
     tracing::error!(
         path = %source_path,
         error = %err,
-        "skipping nested archive (convert failed); it will NOT appear in the output archive"
+        kind,
+        "skipping member; it will NOT appear in the output archive"
     );
     // Always surface on stderr so operators see it even at default log levels.
-    eprintln!(
-        "warning: skipping nested archive '{source_path}': {err} (not included in output)"
+    eprintln!("warning: skipping {kind} '{source_path}': {err} (not included in output)");
+}
+
+fn stage_passthrough(
+    backend: &dyn ArchiveBackend,
+    opts: &PipelineOptions,
+    entry: &plan::PlannedEntry,
+    index: usize,
+    pass_tmp: &Path,
+    use_solid_pass: bool,
+    outer_pass: &Path,
+    outer: &SyncedOuterWriter,
+) -> Result<()> {
+    if !is_safe_member_path(&entry.dest_path) {
+        return Err(Error::Other(format!(
+            "unsafe destination path: {}",
+            entry.dest_path
+        )));
+    }
+    // Unique temp name (index prefix avoids a/b vs a__b collisions).
+    let tmp = pass_tmp.join(format!("{index:04}_{}", entry.dest_path.replace('/', "__")));
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if use_solid_pass {
+        let src = find_extracted(outer_pass, &entry.source_path)?;
+        if !src.is_file() {
+            return Err(Error::Other(format!(
+                "extracted member is not a regular file: {}",
+                src.display()
+            )));
+        }
+        fs::copy(&src, &tmp)?;
+        let _ = fs::remove_file(&src);
+    } else {
+        backend.extract_member(&opts.input, &entry.source_path, &tmp)?;
+    }
+    if !tmp.is_file() {
+        let _ = fs::remove_file(&tmp);
+        return Err(Error::Other(
+            "extracted passthrough is not a regular file".into(),
+        ));
+    }
+    let mut meta = entry.meta.clone();
+    meta.merge_missing(&FileMeta::from_fs_path(&tmp));
+    outer.push_path_with_meta(entry.dest_path.clone(), &tmp, Some(meta))?;
+    let _ = fs::remove_file(&tmp);
+    tracing::info!(
+        path = %entry.source_path,
+        dest = %entry.dest_path,
+        "passthrough outer member (appended)"
     );
+    Ok(())
 }
 
 fn log_stage(opts: &PipelineOptions, stage: &str, d: std::time::Duration) {
@@ -639,29 +713,61 @@ fn convert_nested_parallel_budget(
 
 fn find_extracted(root: &Path, member: &str) -> Result<PathBuf> {
     let norm = normalize_member_path(member);
+    if !is_safe_member_path(&norm) {
+        return Err(Error::Other(format!("unsafe extracted member path: {norm}")));
+    }
     let direct = root.join(&norm);
     if direct.is_file() {
         return Ok(direct);
     }
     let base = norm.rsplit('/').next().unwrap_or(&norm);
+    let mut exact: Option<PathBuf> = None;
+    let mut basename_hits: Vec<PathBuf> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let rd = match fs::read_dir(&dir) {
             Ok(rd) => rd,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(path = %dir.display(), error = %e, "skip unreadable extract dir");
+                continue;
+            }
         };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if p.is_file()
-                && p.file_name().and_then(|s| s.to_str()) == Some(base)
-            {
-                return Ok(p);
+                continue;
+            }
+            if !p.is_file() {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if normalize_member_path(&rel) == norm {
+                exact = Some(p);
+                break;
+            }
+            if p.file_name().and_then(|s| s.to_str()) == Some(base) {
+                basename_hits.push(p);
             }
         }
+        if exact.is_some() {
+            break;
+        }
     }
-    Err(Error::EntryNotFound(member.to_string()))
+    if let Some(p) = exact {
+        return Ok(p);
+    }
+    match basename_hits.len() {
+        1 => Ok(basename_hits.remove(0)),
+        0 => Err(Error::EntryNotFound(member.to_string())),
+        n => Err(Error::Other(format!(
+            "ambiguous extracted member '{member}': {n} files named '{base}'"
+        ))),
+    }
 }
 
 fn persist_file(src: &Path, dest: &Path) -> Result<()> {
@@ -717,7 +823,10 @@ fn persist_dir(src: &Path, dest: &Path) -> Result<()> {
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
-    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(src) {
+        let entry = entry.map_err(|e| {
+            Error::Other(format!("walk {} for persist: {e}", src.display()))
+        })?;
         let rel = entry.path().strip_prefix(src).map_err(|e| {
             Error::Other(format!("strip prefix: {e}"))
         })?;
@@ -729,6 +838,11 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(entry.path(), &target)?;
+        } else {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping non-regular file while persisting directory outer"
+            );
         }
     }
     Ok(())
@@ -771,6 +885,12 @@ fn convert_one_nested_from_file(
         let t = Instant::now();
         let output = conv.convert(backend, inner_in, &ctx)?;
         log_stage(opts, "nested_convert", t.elapsed());
+        if !output.path.is_file() {
+            return Err(Error::Other(format!(
+                "nested convert produced no regular file: {}",
+                output.path.display()
+            )));
+        }
 
         if !is_safe_member_path(dest_member) {
             return Err(Error::Other(format!(
@@ -861,4 +981,248 @@ pub fn list_file_paths(backend: &dyn ArchiveBackend, archive: &Path) -> Result<V
 
 pub fn staging_path_for(dest_member: &str) -> PathBuf {
     PathBuf::from(normalize_member_path(dest_member))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::ArchiveFormat;
+    use crate::codec::OuterFormat;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    fn file_entry(path: &str) -> EntryMeta {
+        EntryMeta {
+            path: path.into(),
+            size: 8,
+            is_dir: false,
+            format_hint: ArchiveFormat::Unknown,
+            meta: Default::default(),
+        }
+    }
+
+    /// In-memory backend for pipeline skip / bulk-fallback regressions.
+    struct ScriptedBackend {
+        entries: Vec<EntryMeta>,
+        blobs: HashMap<String, Vec<u8>>,
+        fail_extract: HashSet<String>,
+        fail_bulk: bool,
+        omit_from_bulk: HashSet<String>,
+        bulk_calls: Mutex<usize>,
+        member_calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(pairs: &[(&str, &[u8])]) -> Self {
+            let mut blobs = HashMap::new();
+            let mut entries = Vec::new();
+            for (path, data) in pairs {
+                blobs.insert((*path).to_string(), data.to_vec());
+                entries.push(file_entry(path));
+            }
+            Self {
+                entries,
+                blobs,
+                fail_extract: HashSet::new(),
+                fail_bulk: false,
+                omit_from_bulk: HashSet::new(),
+                bulk_calls: Mutex::new(0),
+                member_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ArchiveBackend for ScriptedBackend {
+        fn format(&self) -> ArchiveFormat {
+            ArchiveFormat::SevenZ
+        }
+
+        fn list(&self, _archive: &Path) -> Result<Vec<EntryMeta>> {
+            Ok(self.entries.clone())
+        }
+
+        fn is_solid(&self, _archive: &Path) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn extract_member(&self, _archive: &Path, member: &str, dest_file: &Path) -> Result<()> {
+            self.member_calls
+                .lock()
+                .unwrap()
+                .push(member.to_string());
+            if self.fail_extract.contains(member) {
+                return Err(Error::Other(format!("scripted extract fail: {member}")));
+            }
+            let data = self
+                .blobs
+                .get(member)
+                .ok_or_else(|| Error::EntryNotFound(member.to_string()))?;
+            if let Some(p) = dest_file.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::write(dest_file, data)?;
+            Ok(())
+        }
+
+        fn extract_members(&self, archive: &Path, members: &[&str], dest_dir: &Path) -> Result<()> {
+            *self.bulk_calls.lock().unwrap() += 1;
+            if self.fail_bulk {
+                return Err(Error::Other("scripted bulk extract failed".into()));
+            }
+            fs::create_dir_all(dest_dir)?;
+            for m in members {
+                if self.omit_from_bulk.contains(*m) {
+                    continue;
+                }
+                let dest = dest_dir.join(m);
+                self.extract_member(archive, m, &dest)?;
+            }
+            Ok(())
+        }
+
+        fn extract_all(&self, _archive: &Path, _dest_dir: &Path) -> Result<()> {
+            Err(Error::Other("extract_all unused in scripted tests".into()))
+        }
+
+        fn pack_dir(&self, _src: &Path, _dest: &Path, _opts: &PackOptions) -> Result<()> {
+            Err(Error::Other("pack_dir unused in scripted tests".into()))
+        }
+
+        fn test(&self, _archive: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_passthrough_job(backend: &ScriptedBackend, out: &Path) -> ConversionPlan {
+        let input = out.parent().unwrap().join("dummy-input.7z");
+        fs::write(&input, b"not-a-real-archive").unwrap();
+        let mut opts = PipelineOptions::new(input, out.to_path_buf());
+        opts.outer_format = OuterFormat::Dir;
+        opts.verify = false;
+        opts.solid_single_pass = true;
+        opts.nested_concurrency = 1;
+        opts.temp_dir = Some(out.parent().unwrap().join("tmp"));
+        run(backend, &opts).expect("pipeline should succeed")
+    }
+
+    #[test]
+    fn find_extracted_prefers_exact_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("nested/foo.7z");
+        let b = dir.path().join("other/foo.7z");
+        fs::create_dir_all(a.parent().unwrap()).unwrap();
+        fs::create_dir_all(b.parent().unwrap()).unwrap();
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let got = find_extracted(dir.path(), "nested/foo.7z").unwrap();
+        assert_eq!(got, a);
+    }
+
+    #[test]
+    fn find_extracted_unique_basename_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("other/bar.7z");
+        fs::create_dir_all(only.parent().unwrap()).unwrap();
+        fs::write(&only, b"x").unwrap();
+        let got = find_extracted(dir.path(), "wanted/bar.7z").unwrap();
+        assert_eq!(got, only);
+    }
+
+    #[test]
+    fn find_extracted_ambiguous_basename_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["a/foo.7z", "b/foo.7z"] {
+            let p = dir.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"x").unwrap();
+        }
+        let err = find_extracted(dir.path(), "missing/foo.7z").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn find_extracted_rejects_unsafe_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = find_extracted(dir.path(), "../evil").unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+    }
+
+    #[test]
+    fn passthrough_extract_failure_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[
+            ("keep.txt", b"keep"),
+            ("drop.txt", b"drop"),
+            ("also.txt", b"also"),
+        ]);
+        backend.fail_extract.insert("drop.txt".into());
+        backend.fail_bulk = true;
+        let out = dir.path().join("out");
+        let plan = run_passthrough_job(&backend, &out);
+        assert_eq!(plan.runtime.passthrough_written, 2);
+        assert_eq!(plan.runtime.passthrough_skipped, 1);
+        assert!(out.join("keep.txt").is_file());
+        assert!(out.join("also.txt").is_file());
+        assert!(!out.join("drop.txt").exists());
+        assert_eq!(*backend.bulk_calls.lock().unwrap(), 1);
+        assert!(
+            backend
+                .member_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m == "drop.txt")
+        );
+    }
+
+    #[test]
+    fn bulk_extract_failure_falls_back_to_per_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[("a.txt", b"aaa"), ("b.txt", b"bbb")]);
+        backend.fail_bulk = true;
+        let out = dir.path().join("out");
+        let plan = run_passthrough_job(&backend, &out);
+        assert_eq!(plan.runtime.passthrough_written, 2);
+        assert_eq!(plan.runtime.passthrough_skipped, 0);
+        assert_eq!(*backend.bulk_calls.lock().unwrap(), 1);
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"aaa");
+        assert_eq!(fs::read(out.join("b.txt")).unwrap(), b"bbb");
+    }
+
+    #[test]
+    fn missing_bulk_member_is_skipped_others_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[("a.txt", b"aaa"), ("ghost.txt", b"g")]);
+        backend.omit_from_bulk.insert("ghost.txt".into());
+        let out = dir.path().join("out");
+        let plan = run_passthrough_job(&backend, &out);
+        assert_eq!(plan.runtime.passthrough_written, 1);
+        assert_eq!(plan.runtime.passthrough_skipped, 1);
+        assert!(out.join("a.txt").is_file());
+        assert!(!out.join("ghost.txt").exists());
+    }
+
+    #[test]
+    fn all_passthrough_failures_error_with_nothing_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = ScriptedBackend::new(&[("a.txt", b"a"), ("b.txt", b"b")]);
+        backend.fail_extract.insert("a.txt".into());
+        backend.fail_extract.insert("b.txt".into());
+        backend.fail_bulk = true;
+        let input = dir.path().join("in.7z");
+        fs::write(&input, b"x").unwrap();
+        let out = dir.path().join("out");
+        let mut opts = PipelineOptions::new(input, out);
+        opts.outer_format = OuterFormat::Dir;
+        opts.temp_dir = Some(dir.path().join("tmp"));
+        let err = run(&backend, &opts).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to write"),
+            "{err}"
+        );
+    }
 }

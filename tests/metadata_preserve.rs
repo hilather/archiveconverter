@@ -26,17 +26,23 @@ const MTIME_README: u64 = 1_514_160_000; // ~2017-12-25
 const MTIME_NEST: u64 = 1_552_200_000; // ~2019-03-10
 
 fn set_mtime(path: &Path, unix_secs: u64) {
-    // Portable enough for CI/Linux tests: touch -d @epoch
-    let status = Command::new("touch")
-        .args(["-d", &format!("@{unix_secs}")])
-        .arg(path)
-        .status()
-        .expect("spawn touch");
-    assert!(
-        status.success(),
-        "touch -d @{unix_secs} failed for {}",
-        path.display()
-    );
+    common::set_mtime(path, unix_secs);
+}
+
+#[test]
+fn set_mtime_helper_roundtrips_without_gnu_touch() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("seed.txt");
+    fs::write(&p, b"x").unwrap();
+    set_mtime(&p, MTIME_A);
+    let got = fs::metadata(&p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(got, MTIME_A);
 }
 
 fn unix_to_filetime(unix_secs: u64) -> u64 {

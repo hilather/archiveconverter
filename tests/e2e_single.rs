@@ -56,3 +56,32 @@ fn pack_and_list_roundtrip() {
     assert!(paths.iter().any(|p| p == "a.txt" || p.ends_with("a.txt")));
     assert!(paths.iter().any(|p| p.contains("c.txt")));
 }
+
+#[test]
+fn convert_single_rsync_exclude_from() {
+    ensure_7z();
+    let root = tempfile::tempdir().unwrap();
+    let solid = make_inner_solid(root.path(), "solid.7z");
+    let out = root.path().join("nonsolid.7z");
+    let rules = root.path().join("ex");
+    fs::write(&rules, "*.tmp\n__MACOSX/\n").unwrap();
+
+    let mut exclude = MemberFilter::new();
+    exclude.add_exclude_from(&rules).unwrap();
+    convert_single(
+        &backend(),
+        &solid,
+        &out,
+        &exclude,
+        &default_pack(),
+        true,
+        Some(&root.path().join("tmp")),
+        false,
+    )
+    .unwrap();
+
+    let paths = list_paths(&out);
+    assert!(paths.iter().any(|p| p.contains("hello.txt")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.ends_with(".tmp")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("__MACOSX")), "{paths:?}");
+}

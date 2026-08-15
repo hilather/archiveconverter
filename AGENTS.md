@@ -69,7 +69,7 @@ Defaults that must stay accurate in docs:
 - `--nested-size-budget` default **500M**  
 - **Single nest** → pack threads **1**  
 - Dir mode default path: **input stem** next to input archive  
-- Corrupt nests: **skip**, do not fail the whole job  
+- Corrupt / unexpected members: **skip**, do not fail the whole job (empty output still errors)  
 
 ---
 

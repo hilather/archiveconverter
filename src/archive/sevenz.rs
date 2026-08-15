@@ -4,7 +4,7 @@ use super::detect::format_from_path;
 use super::{ArchiveBackend, ArchiveFormat, EntryMeta, PackOptions};
 use crate::codec::FileMeta;
 use crate::error::{Error, Result};
-use crate::util::pathnorm::normalize_member_path;
+use crate::util::pathnorm::{is_safe_member_path, normalize_member_path};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -137,6 +137,13 @@ impl ArchiveBackend for SevenZCli {
         if members.is_empty() {
             return Ok(());
         }
+        for m in members {
+            if !is_safe_member_path(m) {
+                return Err(Error::Other(format!(
+                    "refusing to extract unsafe member path: {m}"
+                )));
+            }
+        }
         fs::create_dir_all(dest_dir)?;
         let archive_s = archive.to_string_lossy().into_owned();
         let out_s = format!("-o{}", dest_dir.display());
@@ -156,6 +163,11 @@ impl ArchiveBackend for SevenZCli {
     }
 
     fn extract_member(&self, archive: &Path, member: &str, dest_file: &Path) -> Result<()> {
+        if !is_safe_member_path(member) {
+            return Err(Error::Other(format!(
+                "refusing to extract unsafe member path: {member}"
+            )));
+        }
         if let Some(parent) = dest_file.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -292,6 +304,8 @@ impl ArchiveBackend for SevenZCli {
 fn find_extracted_file(root: &Path, member: &str) -> Result<PathBuf> {
     let want = normalize_member_path(member);
     let want_base = want.rsplit('/').next().unwrap_or(&want);
+    let mut exact: Option<PathBuf> = None;
+    let mut basename_hits: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry.map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
         if !entry.file_type().is_file() {
@@ -303,13 +317,24 @@ fn find_extracted_file(root: &Path, member: &str) -> Result<PathBuf> {
             .unwrap_or(entry.path())
             .to_string_lossy()
             .replace('\\', "/");
-        if normalize_member_path(&rel) == want
-            || entry.file_name().to_string_lossy() == want_base
-        {
-            return Ok(entry.path().to_path_buf());
+        if normalize_member_path(&rel) == want {
+            exact = Some(entry.path().to_path_buf());
+            break;
+        }
+        if entry.file_name().to_string_lossy() == want_base {
+            basename_hits.push(entry.path().to_path_buf());
         }
     }
-    Err(Error::EntryNotFound(member.to_string()))
+    if let Some(p) = exact {
+        return Ok(p);
+    }
+    match basename_hits.len() {
+        1 => Ok(basename_hits.remove(0)),
+        0 => Err(Error::EntryNotFound(member.to_string())),
+        n => Err(Error::Other(format!(
+            "ambiguous extracted member '{member}': {n} files named '{want_base}'"
+        ))),
+    }
 }
 
 /// Parse archive-level `Solid = +` from full `7z l -slt` output (not `-ba`).
@@ -562,5 +587,23 @@ Size = 1
             Ok(p) => assert!(p.exists(), "{}", p.display()),
             Err(e) => eprintln!("7z not installed: {e}"),
         }
+    }
+
+    #[test]
+    fn extract_rejects_unsafe_member_paths() {
+        let cli = match SevenZCli::discover() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let dummy = Path::new("missing.7z");
+        let dest = tempfile::tempdir().unwrap();
+        let err = cli
+            .extract_member(dummy, "../evil", &dest.path().join("x"))
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+        let err = cli
+            .extract_members(dummy, &["foo/../../evil"], dest.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
     }
 }
