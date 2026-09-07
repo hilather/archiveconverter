@@ -1,6 +1,6 @@
 [package]
 name = "archiveconverter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Convert nested solid 7z archives to non-solid form with filtering and renaming"
 license = "MIT"
